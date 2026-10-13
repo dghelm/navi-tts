@@ -605,6 +605,15 @@ from the model instead. That cost the 0.6B 1.4 % of its frame time (19.1646 ->
 on whether the vector fits the floor, and the model that fits keeps the static form:
 19.1689 ms, +0.02 %. Measured, not reasoned - the first attempt was the slow one.
 
+The two specializations were checked in the binary metadata rather than inferred: the
+floor one allocates 33,920 B of static LDS and the dynamic one allocates zero, so the
+unused array in each is removed. HIP-Clang does support an `extern __shared__`
+declaration alongside a static `__shared__` array in the same kernel, which is
+what makes the pair legal; dead-storage removal, though, is an optimization and not a
+portable allocation guarantee. It does not have to be one here - the occupancy query
+and the launch each use the size that specialization actually needs, so a compiler that
+kept the unused array would report lower occupancy rather than corrupt anything.
+
 **A gate that matching codes do not give you.** The frame gate asks for the first two
 frames to match all 16 codes, and the initial plan argued that was enough to cover the
 projection. It is not, and a negative control settled it: putting a **1 % error in the
@@ -613,7 +622,14 @@ written - because an argmax over 2048 logits survives a small perturbation. So
 `dump_reference.py` now dumps `cp_inputs.npy`, the predictor's 16 projected
 inputs for frame 0, and `test_frame` compares them at 5e-3 rel-rms (the prefill
 gate's own number for f16 weights against an f32 reference). The 1.7B measures 1.9e-4;
-the 1 % control fails at 1.39e-2. Dropping the bias entirely fails both gates.
+the 1 % control fails at 1.39e-2. Dropping the bias entirely fails both gates. Two more holes in that gate turned up in
+review and are worth the same note: a non-finite value in the *reference* used to pass
+silently, because `rel_rms` became a NaN and every comparison against a NaN is
+false, so the row was never selected as the worst one - the gate now checks both sides
+and the derived metrics, and judges all 16 rows rather than only the one it prints. And
+the position bound above had no test, because neither of its cases is reachable through
+`Talker`'s default `max_positions`; it is now exercised with a KV cache
+that claims more room than the kernel's vector has.
 
 **Results, gfx1151.** 10/10 ctest gates pass, identically with
 `HIP_LAUNCH_BLOCKING=1` (this chip has silently-wrong-GPU history). The 1.7B
