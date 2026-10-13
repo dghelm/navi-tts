@@ -15,6 +15,7 @@
 #include "runtime/device/device.h"
 #include "runtime/weights/device_weights.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -62,6 +63,15 @@ public:
     const float * d_step_out() const;   // next frame's step embedding
     int grid_blocks() const;
     int occupancy_per_mp() const;       // hipOccupancyMaxActiveBlocksPerMultiprocessor for the kernel
+    std::size_t lds_bytes() const;      // the dynamic LDS the kernel is launched with (sized per model)
+
+    // The parity gate for the code predictor's input stage (its small_to_mtp_projection
+    // on a model whose talker and predictor widths differ). Off by default: with no
+    // buffer the kernel does not capture. Once on, every frame overwrites it, so read
+    // it straight after the frame whose inputs are wanted.
+    void enable_cp_input_capture();
+    const float * d_cp_inputs() const;  // [16][cp hidden], or null if capture is off
+    int cp_hidden() const;
 
     struct Impl;
 
