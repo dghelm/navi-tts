@@ -63,7 +63,11 @@ public:
     const float * d_step_out() const;   // next frame's step embedding
     int grid_blocks() const;
     int occupancy_per_mp() const;       // hipOccupancyMaxActiveBlocksPerMultiprocessor for the kernel
-    std::size_t lds_bytes() const;      // the dynamic LDS the kernel is launched with (sized per model)
+    std::size_t lds_bytes() const;      // the LDS block the kernel runs with (sized per model)
+    // The highest position the talker step can attend over: attend() keeps one score
+    // per key position in the LDS vector. Frame::run refuses anything at or past it,
+    // independently of whether the KV cache has room.
+    int max_position() const;
 
     // The parity gate for the code predictor's input stage (its small_to_mtp_projection
     // on a model whose talker and predictor widths differ). Off by default: with no

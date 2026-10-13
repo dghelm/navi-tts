@@ -25,7 +25,10 @@
 #include <vector>
 
 // Same shape of report as test_prefill: max|d| against the reference's own scale, and
-// the relative RMS that the gate is set on.
+// the relative RMS that the gate is set on. `finite` covers both sides and the metrics:
+// a non-finite value anywhere makes rel_rms a NaN, and every comparison against a NaN
+// is false, so a row like that would never be picked as the worst one and would pass
+// a bare threshold test unnoticed.
 struct Cmp { double max_abs = 0, ref_max = 0, rel_rms = 0; bool finite = true; };
 
 static Cmp compare(const float * a, const std::vector<float> & b, std::size_t off, std::size_t n) {
@@ -33,7 +36,7 @@ static Cmp compare(const float * a, const std::vector<float> & b, std::size_t of
     double se = 0, ss = 0;
     for (std::size_t i = 0; i < n; ++i) {
         const double x = a[i], y = b[off + i];
-        if (!std::isfinite(x)) c.finite = false;
+        if (!std::isfinite(x) || !std::isfinite(y)) c.finite = false;
         const double d = std::fabs(x - y);
         c.max_abs = std::max(c.max_abs, d);
         c.ref_max = std::max(c.ref_max, std::fabs(y));
@@ -41,6 +44,7 @@ static Cmp compare(const float * a, const std::vector<float> & b, std::size_t of
         ss += y * y;
     }
     c.rel_rms = std::sqrt(se / (ss > 0 ? ss : 1e-30));
+    if (!std::isfinite(c.rel_rms) || !std::isfinite(c.max_abs)) c.finite = false;
     return c;
 }
 
@@ -92,6 +96,7 @@ int main(int argc, char ** argv) {
         std::vector<int> per_frame_matches;
         Cmp cp_worst;
         int cp_worst_pos = 0;
+        bool cp_rows_ok = true;   // every row, not just the one reported as worst
         for (int i = 0; i < n_ref; ++i) {
             const float * trailing = i < pr.n_trailing ? pr.trailing + static_cast<std::size_t>(i) * H : pr.tts_pad;
             navi::qwen3tts::FrameResult r = i == 0
@@ -109,7 +114,15 @@ int main(int argc, char ** argv) {
                 for (int pos = 0; pos < 16; ++pos) {
                     const std::size_t off = static_cast<std::size_t>(pos) * CH;
                     const Cmp c = compare(got.data() + off, want_cp_in, off, static_cast<std::size_t>(CH));
-                    if (!c.finite || c.rel_rms > cp_worst.rel_rms) { cp_worst = c; cp_worst_pos = pos; }
+                    const bool row_ok = c.finite && c.rel_rms < 5e-3;
+                    if (!row_ok) {
+                        cp_rows_ok = false;
+                        std::printf("cp inputs, position %d: rel-rms %.2e%s  OVER THE GATE\n", pos,
+                                    c.rel_rms, c.finite ? "" : " (NON-FINITE)");
+                    }
+                    // a non-finite row outranks any finite one, and is never displaced by one
+                    const bool worse = !c.finite || (cp_worst.finite && c.rel_rms > cp_worst.rel_rms);
+                    if (worse) { cp_worst = c; cp_worst_pos = pos; }
                 }
                 std::printf("cp inputs, frame 0, worst of 16 positions (pos %d): max|d| %.3e (ref max %.3e, rel %.2e)"
                             "  rel-rms %.2e%s\n", cp_worst_pos, cp_worst.max_abs, cp_worst.ref_max,
@@ -178,14 +191,37 @@ int main(int argc, char ** argv) {
             if (!r.ok) { std::printf("frame after the timeout FAILED: %s\n", r.error.c_str()); timeout_ok = false; }
         }
 
+        // The LDS score vector bounds the position as well as the KV cache does: attend()
+        // keeps one score per key position, so a position past the vector would write off
+        // its end. Neither bound is reachable through Talker's default max_positions, so
+        // exercise it with a cache that claims more room than the kernel's vector has.
+        // Both must be refused before anything is launched or written.
+        bool bound_ok = false;
+        {
+            navi::qwen3tts::KvCache fake = talker->kv();   // same device buffers, a bigger claim
+            fake.max_pos = frame->max_position() + 16;
+            const auto over = frame->run(fake, frame->max_position(), pr.trailing, s, 0, 1);
+            const auto neg = frame->run(fake, -1, pr.trailing, s, 0, 1);
+            const auto has = [](const navi::qwen3tts::FrameResult & r) {
+                return !r.ok && r.error.find("score vector") != std::string::npos;
+            };
+            bound_ok = has(over) && has(neg);
+            std::printf("position bound (vector %d): at the limit %s, negative %s\n", frame->max_position(),
+                        has(over) ? "refused" : "ACCEPTED (!)", has(neg) ? "refused" : "ACCEPTED (!)");
+            talker->prefill(pr);
+            frame->reset();
+            const auto after = frame->run_first(talker->d_hidden(), talker->d_logits(), pr.trailing, s, 0, 0);
+            if (!after.ok) { std::printf("frame after the bound checks FAILED: %s\n", after.error.c_str()); bound_ok = false; }
+        }
+
         // gate (DESIGN 6): the first frames match code-for-code; a later divergence in a greedy
         // chain is a near-tie flipping under f16 KV / accumulation order, not a bug by itself.
         // cp inputs: one f16 embedding row (or the f32 hidden at position 0) through one f16
         // GEMV and an f32 bias against an f32 reference, so the error class is the same weight
         // quantisation the prefill gate allows 5e-3 rel-rms for (test_prefill.cpp "prefill embeds").
-        const bool cp_ok = cp_worst.finite && cp_worst.rel_rms < 5e-3;
+        const bool cp_ok = cp_rows_ok && cp_worst.finite && cp_worst.rel_rms < 5e-3;
         if (!cp_ok) std::printf("cp inputs FAILED the 5e-3 rel-rms gate\n");
-        const bool ok = matched_frames >= 2 && det_ok && timeout_ok && cp_ok;
+        const bool ok = matched_frames >= 2 && det_ok && timeout_ok && cp_ok && bound_ok;
         std::printf("%s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     } catch (const std::exception & e) {

@@ -188,6 +188,15 @@ int cmd_info(const Args & a) {
     std::printf("  code predictor    %d layers, hidden %d, %d/%d heads x %d, ff %d, %d codebooks x %d\n",
                 params.cp.n_layer, params.cp.hidden, params.cp.n_head, params.cp.n_kv_head, params.cp.head_dim,
                 params.cp.ff, params.n_code_groups, params.cp.vocab);
+    // Its input embeddings are stored at the talker's width either way (docs/model.md);
+    // when that differs from its own, every one of its steps is projected down first.
+    if (params.cp.hidden != params.talker.hidden) {
+        std::printf("    inputs          embedded at the talker's %d, projected to %d by small_to_mtp_projection [%d, %d] + bias\n",
+                    params.talker.hidden, params.cp.hidden, params.cp.hidden, params.talker.hidden);
+    } else {
+        std::printf("    inputs          embedded at the talker's %d, same width: no projection stage\n",
+                    params.talker.hidden);
+    }
     std::printf("  vocoder           %d layers, hidden %d, latent %d, %d x %d codebooks, %d samples/frame @ %d Hz%s\n",
                 params.vocoder.n_layer, params.vocoder.hidden, params.vq_latent, params.vq_n_q,
                 params.vq_codebook_size, params.codec_upsample, params.codec_sample_rate,
