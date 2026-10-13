@@ -10,15 +10,20 @@ writes what each engine stage is checked against:
   text_ids.npy            token ids of the assistant-formatted prompt (BPE gate)
   tokenizer_cases.json    more strings -> ids for the tokenizer tests
   speaker_mels.npy        [n_mels, T] mel input to the speaker encoder
-  speaker_embedding.npy   [1024] (speaker encoder gate)
+  speaker_embedding.npy   [speaker enc_dim] (speaker encoder gate)
   ref_codes.npy           [T, 16] codec encoder output for the reference audio (ICL, later)
-  prefill_embeds.npy      [T, 1024] the talker prefill input (embeddings, after text_projection)
+  prefill_embeds.npy      [T, talker hidden] the talker prefill input (embeddings, after text_projection)
   prefill_mask.npy        [T] attention mask (all ones at batch one)
   prefill_position_ids.npy [3, T] M-RoPE positions
-  trailing_text.npy       [n, 1024] the per-frame trailing text rows (text tokens[1:] + tts_eos)
-  tts_pad_embed.npy       [1024] the row added once trailing text is exhausted
-  prefill_hidden.npy      [1024] post-norm talker hidden at the last prefill position
+  trailing_text.npy       [n, talker hidden] the per-frame trailing text rows (text tokens[1:] + tts_eos)
+  tts_pad_embed.npy       [talker hidden] the row added once trailing text is exhausted
+  prefill_hidden.npy      [talker hidden] post-norm talker hidden at the last prefill position
   prefill_logits.npy      [3072] codec_head logits at that position
+  cp_inputs.npy           [16, cp hidden] the code predictor's 16 inputs for greedy frame 0, after
+                          its small_to_mtp_projection. The predictor's embeddings are stored at the
+                          TALKER's width and projected down to its own when the two differ (1.7B);
+                          when they are equal (0.6B) that stage is nn.Identity() and this is the raw
+                          embeddings. Gates the engine's cp_embed, projection stage included.
   prefill_kv.npz          k_{l}, v_{l}: [T, n_kv_head, head_dim] after RoPE, per talker layer
   greedy_codes.npy        [n_frames, 16] argmax run with the default repetition penalty (the
                           talker / code-predictor gate). Argmax decoding collapses into a loop of
@@ -249,6 +254,21 @@ def main():
     np.save(out / "prefill_logits.npy", logits_last.numpy().astype(np.float32))
     position_ids, _ = talker.get_rope_index(mask)
     np.save(out / "prefill_position_ids.npy", position_ids[:, 0].numpy().astype(np.int32))
+
+    # --- the code predictor's inputs for frame 0 (the projection gate) ----------
+    # Assembled the way Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.forward
+    # does: the talker's hidden at position 0, the TALKER's codec_embedding of codebook 0
+    # at position 1, then step p's fed-back code through the predictor's own table p-2
+    # (HF embeds generation step g with get_input_embeddings()[g-1], and at position p the
+    # step is g = p-1). All at the talker's width, then the projection.
+    cpm = talker.code_predictor
+    cp_rows = [hidden_last.unsqueeze(0), talker.get_input_embeddings()(torch.tensor([int(greedy[0, 0])]))]
+    for pos in range(2, tcfg.num_code_groups):
+        cp_rows.append(cpm.get_input_embeddings()[pos - 2](torch.tensor([int(greedy[0, pos - 1])])))
+    cp_inputs = cpm.small_to_mtp_projection(torch.cat(cp_rows, dim=0))
+    np.save(out / "cp_inputs.npy", cp_inputs.numpy().astype(np.float32))
+    print(f"cp inputs: {tuple(cp_inputs.shape)}, projection "
+          f"{type(cpm.small_to_mtp_projection).__name__}", file=sys.stderr)
     kv = {}
     cache = pre.past_key_values
     for l in range(tcfg.num_hidden_layers):
@@ -300,6 +320,9 @@ def main():
         "n_text_ids": int(text_ids.shape[1]),
         "prefill_len": int(embeds.shape[1]),
         "trailing_len": int(trailing.shape[1]),
+        "talker_hidden": int(tcfg.hidden_size),
+        "cp_hidden": int(tcfg.code_predictor_config.hidden_size),
+        "cp_projection": type(model.talker.code_predictor.small_to_mtp_projection).__name__,
         "greedy_frames": int(greedy.shape[0]),
         "sampled_frames": int(sampled.shape[0]),
         "sampled_samples": int(pcm.shape[0]),

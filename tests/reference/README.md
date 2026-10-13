@@ -26,6 +26,12 @@ the docstring of the script and `docs/model.md` describe every file.
   weight quantisation, identical in torch, and not something the kernels can
   close; DESIGN 6's "within 1e-4" would need f32 vocoder weights.
 
+`cp_inputs.npy` is the code predictor's 16 inputs for greedy frame 0, after its
+`small_to_mtp_projection`. On this model the talker and the predictor are both
+1024 wide, so that stage is `nn.Identity()` and this is the raw embeddings -
+still a gate on which row `cp_embed` picks per position. The projecting path is
+exercised by `../reference-1.7b/`, whose talker is 2048.
+
 Regenerate (about a minute on the workstation CPU):
 
     cd tools && uv sync && uv run dump_reference.py --model ../models/Qwen3-TTS-12Hz-0.6B-Base --out ../tests/reference
