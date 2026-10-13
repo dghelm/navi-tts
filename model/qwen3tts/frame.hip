@@ -905,6 +905,7 @@ void Frame::enable_cp_input_capture() {
 }
 const float * Frame::d_cp_inputs() const { return impl_->B.cp_input_log; }
 int Frame::cp_hidden() const { return impl_->CP.hidden; }
+int Frame::max_position() const { return impl_->B.vec_max; }
 std::size_t Frame::lds_bytes() const {
     return impl_->floor_lds ? static_cast<std::size_t>(lds_floats(VEC_FLOOR)) * sizeof(float) : impl_->lds_bytes;
 }
