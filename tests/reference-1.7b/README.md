@@ -18,6 +18,12 @@ against this blob's own embedded tokenizer), and `prefill_mask.npy` /
 `prefill_position_ids.npy` (same prompt shape). Everything else differs and is
 its own file. Byte equality was checked with `cmp`, not assumed.
 
+The codec is the same checkpoint in both models (same safetensors sha256), so the four
+encoder files - `ref_conv.npy`, `ref_xf.npy`, `ref_latents.npy`, `ref_codes_f16w.npy` - are
+symlinks as well, `cmp`-verified like the rest. The `icl_*` files are **not**: they carry the
+talker's width, which is the whole point of this directory. See `../reference/README.md` for
+what the encoder and ICL files are and why the ICL set must not be listened to.
+
 `cp_inputs.npy` is the gate for the projection: the predictor's 16 inputs for
 greedy frame 0 **after** `small_to_mtp_projection`. The codes gate does not
 stand in for it - measured on this box, putting a 1% error in the projection's
@@ -37,6 +43,7 @@ Measured against this set (gfx1151, ROCm 10.1.0, same with
 - vocoder: 114.0 dB against the f16-weight reference, 65.5 dB against f32 -
   the same figures as the 0.6B, which is expected: the codec is the same weights
 - sampled run: 83 frames in torch, 87 in the engine, bit-identical run to run
+- ICL prompt: 198 prefill rows (9 + codec_bos + 188 reference frames), 1 trailing row
 
 The greedy run is **not speech** here either; the audible reference is
 `sampled.wav` (6.64 s).
