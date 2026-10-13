@@ -44,5 +44,24 @@
  "transformers": "4.57.3",
  "qwen_tts": "0.1.1",
  "python": "3.13.9",
- "numpy": "2.5.3"
+ "numpy": "2.5.3",
+ "ref_frames": 188,
+ "ref_conv_rows": 375,
+ "ref_codes_f16w_diff": 38,
+ "ref_codes_f16w_note": "documentation, not a gate: f16 encoder weights move the ICL prefill hidden by 1.3e-2 rel-rms, so the engine stores the encoder f32 while the decoder stays f16 (DESIGN 6)",
+ "icl_ref_text": "This is the reference recording used by the parity dumps.",
+ "icl_ref_text_note": "a FIXED STRING, not a transcription of the reference audio: no transcript exists for it. Parity does not depend on it being true. Nothing in the icl_* set is a listen reference.",
+ "icl_n_ref_text_ids": 16,
+ "icl": {
+  "ref_frames": 188,
+  "prefill_len": 198,
+  "trailing_len": 1,
+  "greedy_frames": 31,
+  "sampled_frames": 14
+ },
+ "icl_short": {
+  "ref_frames": 8,
+  "prefill_len": 18,
+  "trailing_len": 20
+ }
 }
