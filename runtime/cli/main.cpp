@@ -201,6 +201,19 @@ int cmd_info(const Args & a) {
                 params.vocoder.n_layer, params.vocoder.hidden, params.vq_latent, params.vq_n_q,
                 params.vq_codebook_size, params.codec_upsample, params.codec_sample_rate,
                 params.has_codec_encoder ? ", encoder included" : "");
+    // The codec encoder is what makes the reference codes an ICL voice is conditioned on.
+    // A blob without it still serves voices whose codes were made elsewhere; it just
+    // cannot clone a new one in ICL mode.
+    if (params.has_codec_encoder) {
+        const auto & e = params.codec_encoder;
+        std::printf("  codec encoder     %s, %d layers, latent %d, %d of %d quantizers x %d x %d, "
+                    "%d samples/frame in\n",
+                    e.dtype.c_str(), e.n_layer, e.latent, e.n_valid_q, e.n_q, e.codebook_size,
+                    e.codebook_dim, e.downsample_rate);
+    } else {
+        std::printf("  codec encoder     absent: embedding-only cloning "
+                    "(convert.py --with-encoder adds it)\n");
+    }
     std::printf("  languages        ");
     for (const auto & [k, v] : params.language_ids) std::printf(" %s=%d", k.c_str(), v);
     std::printf("\n");
