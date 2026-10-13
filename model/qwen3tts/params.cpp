@@ -154,11 +154,19 @@ std::vector<ExpectedTensor> expected_tensors(const Params & p) {
     out.push_back({"talker.model.norm.weight", {H}});
     out.push_back({"talker.codec_head.weight", {CV, H}});
 
-    // code predictor: codebooks 1..15 each have an input embedding and a head
+    // Code predictor: codebooks 1..15 each have an input embedding and a head.
+    // The embeddings are stored at the TALKER's width, not the predictor's: the
+    // same rows also feed the talker's next-frame input (docs/model.md "Code
+    // predictor"). When the two widths differ the predictor's input is projected
+    // down first; when they are equal that stage is the identity and absent.
     const auto CH = static_cast<std::uint64_t>(p.cp.hidden);
     for (std::uint64_t i = 0; i + 1 < G; ++i) {
-        out.push_back({"talker.code_predictor.model.codec_embedding." + std::to_string(i) + ".weight", {PV, CH}});
+        out.push_back({"talker.code_predictor.model.codec_embedding." + std::to_string(i) + ".weight", {PV, H}});
         out.push_back({"talker.code_predictor.lm_head." + std::to_string(i) + ".weight", {PV, CH}});
+    }
+    if (p.cp.hidden != p.talker.hidden) {
+        out.push_back({"talker.code_predictor.small_to_mtp_projection.weight", {CH, H}});
+        out.push_back({"talker.code_predictor.small_to_mtp_projection.bias", {CH}});
     }
     add_decoder_layers(out, "talker.code_predictor.model", p.cp, true);
     out.push_back({"talker.code_predictor.model.norm.weight", {CH}});
