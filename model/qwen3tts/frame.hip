@@ -32,6 +32,8 @@ constexpr int CP_HEADS = 15;        // codebooks 1..15
 // the Talker's max_positions (2048 by default), so the floor is what guarantees
 // the shipped configuration fits; and it keeps the 0.6B's LDS layout unchanged.
 constexpr int VEC_FLOOR = 4096;
+// Floats in the LDS block for a given vector size: [xs][red: 32][hist: 256][idx].
+constexpr int lds_floats(int vec) { return 2 * vec + 32 + 256; }
 constexpr int MV_ROWS = 2;         // rows per wave in a matvec: 2 rows x 4 loads in flight streams ~20% faster than 4 x 2 (bench/README)
 
 struct TlParams { int hidden, n_head, n_kv_head, head_dim, ff, vocab, n_layer; float eps, rope_theta; };
@@ -167,9 +169,11 @@ __device__ __forceinline__ void wave_dot_rows(const uint16_t * W, int row0, int 
 // in cycling groups of MV_ROWS. (A balanced contiguous partition, and fusing
 // q/k/v into one virtual matvec, were measured 2026-09-17: no change - the
 // phase ends when the memory system does, not when the last wave does.)
-// `bias`, when given (non-accumulating only), is added on the wave that owns the
-// row, so no second pass and no barrier is needed to make it visible.
-template <bool ACCUMULATE>
+// BIAS (non-accumulating only) adds `bias` on the wave that owns the row, so no
+// second pass and no barrier is needed to make it visible. It is a template
+// parameter, not a nullable pointer, so the callers that have no bias - every
+// matvec on the per-frame path - compile exactly as they did before.
+template <bool ACCUMULATE, bool BIAS = false>
 __device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const float * xs, float * y,
                             const float * bias = nullptr) {
     const int lane = threadIdx.x % warpSize, wpb = blockDim.x / warpSize;
@@ -182,7 +186,8 @@ __device__ void grid_matvec(const uint16_t * W, int n_rows, int n_cols, const fl
 #pragma unroll
             for (int r = 1; r < MV_ROWS; ++r) if (lane == r) d = acc[r];
             if (ACCUMULATE) y[row0 + lane] += d;
-            else y[row0 + lane] = bias ? d + bias[row0 + lane] : d;
+            else if (BIAS) y[row0 + lane] = d + bias[row0 + lane];
+            else y[row0 + lane] = d;
         }
     }
 }
@@ -492,7 +497,7 @@ __device__ void cp_embed(const CpParams & P, const CpWeights & W, const Work & B
     }
     for (int i = threadIdx.x; i < P.in_dim; i += blockDim.x) xs[i] = (pos == 0) ? B.hidden_out[i] : h2f(row, i);
     __syncthreads();
-    grid_matvec<false>(W.proj_w, P.hidden, P.in_dim, xs, B.cx, W.proj_b);
+    grid_matvec<false, true>(W.proj_w, P.hidden, P.in_dim, xs, B.cx, W.proj_b);
 }
 
 __device__ void cp_head(const CpParams & P, const CpWeights & W, const Work & B, int pos, float * xs, float * red) {
@@ -548,12 +553,20 @@ __device__ void assemble_step(const CpParams & P, const CpWeights & W, const Wor
 
 // --- the frame ----------------------------------------------------------------
 
-__global__ void __launch_bounds__(BLOCK) k_frame(TlParams TP, TlWeights TW, CpParams CP, CpWeights CW, Work B) {
-    // One dynamic LDS block, carved as [xs: vec_max][red: 32][hist: 256][idx: vec_max].
-    // Frame::create computes the same layout's size and passes it to the launch.
-    extern __shared__ float lds[];
-    float * xs = lds;
-    float * red = xs + B.vec_max;
+// FLOOR_LDS: the vector fits VEC_FLOOR, so the block is a compile-time __shared__
+// array and the carve is a compile-time offset - which is how this kernel was
+// written before the 1.7B needed a bigger vector. Measured on gfx1151, going to a
+// runtime LDS base costs the 0.6B about 1.5% of its frame time (LDS addressing
+// loses its immediate offsets), so the model that fits keeps the static form and
+// only the model that does not pays for the flexibility.
+template <bool FLOOR_LDS>
+__global__ void __launch_bounds__(BLOCK) k_frame_t(TlParams TP, TlWeights TW, CpParams CP, CpWeights CW, Work B) {
+    __shared__ float floor_lds[FLOOR_LDS ? lds_floats(VEC_FLOOR) : 1];
+    extern __shared__ float dyn_lds[];
+    float * const base = FLOOR_LDS ? floor_lds : dyn_lds;
+    const int vec = FLOOR_LDS ? VEC_FLOOR : B.vec_max;
+    float * xs = base;
+    float * red = xs + vec;
     unsigned * hist = reinterpret_cast<unsigned *>(red + 32);
     int * idx = reinterpret_cast<int *>(hist + 256);
     const unsigned nb = gridDim.x;
@@ -643,7 +656,8 @@ struct Frame::Impl {
     Work B{};
     FrameOptions opt;
     int grid = 0, occ = 0;
-    std::size_t lds_bytes = 0;
+    std::size_t lds_bytes = 0;    // dynamic LDS for the launch; 0 when the static form is used
+    bool floor_lds = false;
     std::vector<void *> owned;
     hipEvent_t ev0 = nullptr, ev1 = nullptr;
     int32_t h_codes[CP_POS] = {};
@@ -707,8 +721,8 @@ struct Frame::Impl {
         NAVI_HIP(hipMemsetAsync((void *) B.bar, 0, 3 * sizeof(unsigned), stream));
         NAVI_HIP(hipEventRecord(ev0, stream));
         void * args[] = {&TP, &TW, &CP, &CW, &B};
-        const hipError_t e = hipLaunchCooperativeKernel((const void *) k_frame, dim3(grid), dim3(BLOCK), args,
-                                                       lds_bytes, stream);
+        const void * k = floor_lds ? (const void *) k_frame_t<true> : (const void *) k_frame_t<false>;
+        const hipError_t e = hipLaunchCooperativeKernel(k, dim3(grid), dim3(BLOCK), args, lds_bytes, stream);
         if (e != hipSuccess) { r.error = std::string("cooperative launch failed: ") + hipGetErrorString(e); return r; }
         NAVI_HIP(hipEventRecord(ev1, stream));
         NAVI_HIP(hipMemcpyAsync(h_codes, B.codes, sizeof(h_codes), hipMemcpyDeviceToHost, stream));
@@ -746,12 +760,14 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
     // Every vector the kernel stages in LDS, plus the floor (see VEC_FLOOR).
     const int vec_max = std::max({VEC_FLOOR, tp.hidden, tp.ff, tp.vocab, tp.n_head * tp.head_dim,
                                   cp.hidden, cp.ff, cp.vocab, cp.n_head * cp.head_dim});
-    I.lds_bytes = static_cast<std::size_t>(vec_max + 32) * sizeof(float) + 256 * sizeof(unsigned)
-                  + static_cast<std::size_t>(vec_max) * sizeof(int);
-    if (I.lds_bytes > dev.info().lds_per_block) {
-        fail("frame: the model needs " + std::to_string(I.lds_bytes) + " B of LDS per block, the device has "
+    I.floor_lds = vec_max == VEC_FLOOR;
+    const std::size_t need = static_cast<std::size_t>(lds_floats(vec_max)) * sizeof(float);
+    if (need > dev.info().lds_per_block) {
+        fail("frame: the model needs " + std::to_string(need) + " B of LDS per block, the device has "
              + std::to_string(dev.info().lds_per_block));
     }
+    // The static form carries its own LDS; only the larger form asks the launch for it.
+    I.lds_bytes = I.floor_lds ? 0 : need;
 
     I.TP = {tp.hidden, tp.n_head, tp.n_kv_head, tp.head_dim, tp.ff, tp.vocab, tp.n_layer, tp.rms_eps, static_cast<float>(tp.rope_theta)};
     I.CP = {cp.hidden, tp.hidden, cp.n_head, cp.n_kv_head, cp.head_dim, cp.ff, cp.vocab, cp.n_layer, cp.rms_eps, static_cast<float>(cp.rope_theta)};
@@ -825,7 +841,8 @@ std::unique_ptr<Frame> Frame::create(const Device & dev, const DeviceWeights & w
 
     // Grid: blocks_per_mp co-resident blocks per multiprocessor (WGP), checked
     // against what the kernel's registers/LDS actually allow.
-    NAVI_HIP(hipOccupancyMaxActiveBlocksPerMultiprocessor(&I.occ, k_frame, BLOCK, I.lds_bytes));
+    NAVI_HIP(I.floor_lds ? hipOccupancyMaxActiveBlocksPerMultiprocessor(&I.occ, k_frame_t<true>, BLOCK, 0)
+                         : hipOccupancyMaxActiveBlocksPerMultiprocessor(&I.occ, k_frame_t<false>, BLOCK, I.lds_bytes));
     if (I.occ < 1) fail("frame: k_frame cannot be resident at all");
     if (opt.blocks_per_mp > I.occ) {
         fail("frame: blocks_per_mp " + std::to_string(opt.blocks_per_mp) + " exceeds the kernel's occupancy " + std::to_string(I.occ));
@@ -888,7 +905,9 @@ void Frame::enable_cp_input_capture() {
 }
 const float * Frame::d_cp_inputs() const { return impl_->B.cp_input_log; }
 int Frame::cp_hidden() const { return impl_->CP.hidden; }
-std::size_t Frame::lds_bytes() const { return impl_->lds_bytes; }
+std::size_t Frame::lds_bytes() const {
+    return impl_->floor_lds ? static_cast<std::size_t>(lds_floats(VEC_FLOOR)) * sizeof(float) : impl_->lds_bytes;
+}
 int Frame::grid_blocks() const { return impl_->grid; }
 int Frame::occupancy_per_mp() const { return impl_->occ; }
 
