@@ -565,3 +565,75 @@ not proposed. Nothing started.
  2 files changed, 86 insertions(+), 2 deletions(-)
 ```
 
+## 2026-10-13 - Qwen3-TTS-12Hz-1.7B-Base
+
+DESIGN §9 had 1.7B as OPEN with "support via config is nearly free; tuning is not"
+and a recommendation not to target it. It was targeted anyway. "Nearly free" was
+almost right.
+
+**What the wall actually was.** `tools/convert.py` already produced a correct
+4.09 GB blob and the engine already read the 1.7B's dimensions out of it, but
+`info --model` reported 15 shape mismatches and 2 unused tensors, and
+`Frame::create` refused outright on `tp.hidden != cp.hidden`. The cause is
+not a scaling bug: HF builds the code predictor with
+`embedding_dim = talker_config.hidden_size`, so its 15 input embedding tables are
+stored at the **talker's** width, because the talker's next-frame input is built from
+those same rows. When the talker is wider than the predictor, every one of the 16 cp
+positions goes through a `small_to_mtp_projection` Linear first. The 0.6B's two
+widths are both 1024, which makes that stage `nn.Identity()`, absent from the
+checkpoint, and invisible - so the engine had conflated the two widths everywhere.
+
+Three of the four config deltas (talker hidden, talker ff, speaker enc_dim) needed no
+code at all - `Talker`, `SpeakerEncoder`, `Graph`, `Vocoder`,
+`convert.py` and `dump_reference.py` were already parameterised. The whole
+diff is the expected-tensor table and the frame kernel.
+
+**The projection costs no barrier.** Worth recording because the frame kernel's cost
+is barriers, not arithmetic. Each block can name the cp's source embedding row by
+itself - `codes[]` and the talker's hidden are both written before the barrier
+that already precedes the phase - so a block stages the talker-width row into its own
+LDS and the projection is one grid matvec, with the bias folded into
+`grid_matvec`'s write site so it lands on the wave that owns the row. A separate
+bias pass would have needed a barrier to be visible.
+
+**Dynamic LDS, and why it is conditional.** The 1.7B's talker ff is 6144 against the
+0.6B's 3072, over the kernel's `VEC_MAX = 4096`. Raising the constant would have
+cut the 0.6B from 3 resident blocks per MP to 1 on every build, so the vector is sized
+from the model instead. That cost the 0.6B 1.4 % of its frame time (19.1646 ->
+19.4377 ms): a runtime LDS base loses the immediate offsets a compile-time
+`__shared__` array gives the matvec inner loops. So `k_frame` is templated
+on whether the vector fits the floor, and the model that fits keeps the static form:
+19.1689 ms, +0.02 %. Measured, not reasoned - the first attempt was the slow one.
+
+**A gate that matching codes do not give you.** The frame gate asks for the first two
+frames to match all 16 codes, and the initial plan argued that was enough to cover the
+projection. It is not, and a negative control settled it: putting a **1 % error in the
+projection's bias** left greedy frames 0 and 1 matching 16/16 - passing the gate as
+written - because an argmax over 2048 logits survives a small perturbation. So
+`dump_reference.py` now dumps `cp_inputs.npy`, the predictor's 16 projected
+inputs for frame 0, and `test_frame` compares them at 5e-3 rel-rms (the prefill
+gate's own number for f16 weights against an f32 reference). The 1.7B measures 1.9e-4;
+the 1 % control fails at 1.39e-2. Dropping the bias entirely fails both gates.
+
+**Results, gfx1151.** 10/10 ctest gates pass, identically with
+`HIP_LAUNCH_BLOCKING=1` (this chip has silently-wrong-GPU history). The 1.7B
+matches HF's greedy codes on **31 of 31** frames, where the 0.6B diverges at frame 29.
+Frame 32.65 ms, RTF **0.433** on the bench text and **0.428** over a longer
+multi-sentence run with every sentence ending on EOS - 1.63x the 0.6B's frame time for 2x
+the talker's bytes, sublinear because the code predictor is identical between the two
+models and is streamed 15x a frame. Untuned. The 0.6B's bench WAV sha is unchanged
+throughout (`4cb7232a…`): none of this was an arithmetic change.
+
+**What this does not fix.** Nothing here touches how a clone *sounds*. Cloning is
+still speaker-embedding only, which is one vector of timbre and nothing about delivery;
+the model's other mode conditions on a reference's own codes and transcript, and that
+needs the codec encoder (DESIGN §9, still OPEN, now the top quality item). What this
+port buys that is relevant to it is the clean comparison: the same weights under both
+conditioning modes, with size no longer a second variable. RTF is not the finish line.
+
+Also fixed on the way past, separable and not about 1.7B: `attend()` writes one
+score per key position into the LDS vector, but `Frame::run` only checked the KV
+cache's `max_pos`. The two were safe only because `VEC_MAX` happened to
+exceed `Talker`'s default `max_positions`, a coupling across two files that
+nothing enforced; raising `max_positions` past 4096 would have corrupted LDS
+instead of failing.

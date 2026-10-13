@@ -253,6 +253,11 @@ build the same day (`bench/results.jsonl`; the bench WAV's sha is the same
 on both targets, `4cb7232a…` - the kernels are bit-exact across the two).
 `docs/tuning.md` records what moved the numbers and what did not.
 
+The table above is the **0.6B**. The 1.7B-Base, added 2026-10-13 and untuned,
+measures on gfx1151: frame **32.65 ms**, vocoder 1.34 ms/frame, TTFA **171 ms**,
+RTF **0.433** (medians of 10 runs at `648a1f2`). Its own bench WAV sha is
+`4116c79d…`. Not yet measured on gfx1100.
+
 Numbers go on the README front page from the bench harness, per release.
 
 **Measurement, two tools:** `GET /metrics` (Prometheus text format, llama.cpp
@@ -304,14 +309,36 @@ to `bench/results.jsonl`; the README table is generated from that file.
   vocoder batch's PCM) and the response's content-provider callback (writes
   chunks as they arrive); a client that stops reading fails the request rather
   than stalling the GPU worker.
-- **OPEN: ICL cloning (tokenizer encoder).** Voices registered with `ref_text`
-  use in-context cloning and need the audio *encoder*; without it, cloning is
-  speaker-embedding only (what runs today). The encoder is a fourth model
-  component (Conv1D + 8-layer transformer + RVQ). Recommendation: out of M1/M2;
-  revisit as a quality lever in M4 with a listen test first.
-- **OPEN: 1.7B.** Same architecture scaled; RTF 3.0 on the fork's Vulkan path in
-  June, never tried on HIP. Support via config is nearly free; tuning is not.
-  Recommendation: load it as a stretch test in M3, don't target it.
+- **OPEN: ICL cloning (tokenizer encoder) - now the top quality item.** Voices
+  registered with `ref_text` use in-context cloning and need the audio
+  *encoder*; without it, cloning is speaker-embedding only (what runs today). The
+  encoder is a fourth model component (Conv1D + 8-layer transformer + RVQ).
+  Why it moved up: the two conditioning modes are not interchangeable. A speaker
+  embedding is a single vector - it carries timbre and nothing about delivery - while a
+  reference's own codes and words carry its pace as well. With 1.7B supported the
+  comparison is finally clean, too: the same weights under both conditioning modes,
+  with model size no longer a second variable.
+  Recommendation: this, not further RTF work, is the next quality lever. RTF is not
+  the finish line.
+- **DECIDED 2026-10-13: 1.7B-Base is supported.** Measured on gfx1151 rather than left
+  as a stretch test. "Support via config is nearly free" turned out to be
+  almost right: three of the four shape changes are configuration, and the fourth is
+  the code predictor's `small_to_mtp_projection` (`docs/model.md`),
+  which the 0.6B's equal widths hide. The predictor's input embeddings are stored at
+  the talker's width because the talker's next frame is built from the same rows, so a
+  model with a wider talker has to project them down on every one of the 16 cp
+  positions. In the frame kernel that costs no extra grid barrier.
+  **Measured, 10 runs, gfx1151:** 32.65 ms/frame, RTF 0.433 on the bench text, and
+  RTF 0.428 over a longer multi-sentence run with every sentence ending on EOS.
+  That is 1.63x the 0.6B's frame time for 2x the talker's bytes - better than linear,
+  because the code predictor (5 layers x 16 steps) is unchanged and is a large share
+  of the frame. It is inside this chip's RTF 0.5 usefulness bar, with no tuning pass
+  yet. Tuning is still not free and has not been done: `MV_ROWS`, the grid
+  and the spin cap are all still the 0.6B's.
+- **OPEN: which model to serve.** 1.7B costs 1.63x per frame; whether it is worth that
+  is a listen test rather than a measurement. The engine loads either
+  blob with no code change. Note that switching requires re-cloning stored voices: an
+  embedding is the width of the model that made it and the store skips mismatches.
 - **DECIDED: streaming batches.** Vocoder batching never changes the PCM
   (chunked == one-shot is a gate), only when audio arrives and what the vocoder
   costs per frame. A stream vocodes 4 frames first, then 16 (`STREAM_FIRST_BATCH`,
@@ -349,7 +376,9 @@ M0-M2 are the XTX. Nothing runs on the mini PC before M3.
   now), a service unit on the mini PC, grid/spin tuning from data.
 - **M4 — levers.** Frame-kernel fusion of the host tail, spin cap from p99, ICL
   cloning, quantised GEMV (worth re-measuring on gfx1151 even though the XTX
-  ruled it out), 1.7B, fine-tuned weights through the converter.
+  ruled it out), fine-tuned weights through the converter.
+  **1.7B-Base landed 2026-10-13** (§9): gates extended and passing on gfx1151,
+  RTF 0.433 measured, untuned. The quality lever after it is ICL, not more RTF.
 
 ## 11. Carried over from the fork
 

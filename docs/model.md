@@ -1,4 +1,4 @@
-# Qwen3-TTS-12Hz-0.6B-Base: what the engine needs to know
+# Qwen3-TTS-12Hz Base: what the engine needs to know
 
 Re-derived at M0 from the HF release (`config.json`, `speech_tokenizer/config.json`,
 `generation_config.json`, the safetensors headers) and the model's own
@@ -6,13 +6,38 @@ Re-derived at M0 from the HF release (`config.json`, `speech_tokenizer/config.js
 number here is also in the `.navi` KV section (`docs/navi-format.md`), which is
 what the engine actually reads; this file is the human copy.
 
+Shapes below are the **0.6B-Base**, the model the engine shipped with. The
+**1.7B-Base** is the same architecture with a wider talker, supported since
+2026-10-13; the two differ in exactly four numbers, and only one of them needs
+engine code rather than configuration:
+
+| | 0.6B-Base | 1.7B-Base |
+|---|---|---|
+| talker hidden | 1024 | **2048** |
+| talker intermediate | 3072 | **6144** |
+| speaker encoder output | 1024 | **2048** |
+| code predictor hidden | 1024 | 1024 |
+| `small_to_mtp_projection` | absent (Identity) | **2048 -> 1024, with bias** |
+
+Everything else - the code predictor's layer count and shapes, the codec, the
+whole vocoder, the tokenizer, the special ids, the language ids - is identical.
+See "Code predictor" for the projection, which is the one place the widths stop
+being interchangeable.
+
+Switching between the two is a different model file and nothing else, with one
+operational catch: a **stored voice holds an embedding of its model's width**, so
+the voice store skips voices whose width does not match the loaded model (it says
+so on stderr). Re-clone them from their reference audio after a switch
+(`navi-tts voices add`, or `POST /v1/audio/voices`); the stored
+`sample.wav` makes that a local operation.
+
 ## Components
 
 | Component | Params | Tensors | Prefix |
 |---|---|---|---|
 | Text embedding + projection | 151936 × 2048 table, MLP 2048→2048→1024 | 5 | `talker.model.text_embedding`, `talker.text_projection.*` |
 | Talker | 28 layers, 1024 hidden | 311 | `talker.model.*`, `talker.codec_head` |
-| Code predictor | 5 layers, 1024 hidden, 15 heads | 86 | `talker.code_predictor.*` |
+| Code predictor | 5 layers, 1024 hidden, 15 heads | 86 (88 on the 1.7B, with the projection) | `talker.code_predictor.*` |
 | Speaker encoder | ECAPA-TDNN → 1024 | 76 | `speaker_encoder.*` |
 | Codec decoder (vocoder) | 8-layer transformer + convnet | 261 (after baking codebooks) | `codec.decoder.*` |
 | Codec encoder | not converted by default (ICL cloning is OPEN) | — | `codec.encoder.*` |
@@ -141,7 +166,7 @@ exhausted. (`tests/reference/trailing_text.npy`, `tts_pad_embed.npy`.)
 1. Talker step on the input row at position `n_past` → post-norm hidden `h` (1024) → `codec_head` → 3072 logits.
 2. Suppress ids 2048–3071 except `codec_eos` (2050); repetition penalty 1.05 over the codes emitted so far; sample cb0 (temperature 0.9, top-k 50, top-p 1.0 by default). The model's generate also forces at least 2 frames before EOS.
 3. cb0 == `codec_eos` ends the utterance (the frame is not emitted).
-4. Code predictor: a 2-row prefill `[h, talker.codec_embedding(cb0)]` at positions 0 and 1 gives codebook 1 from `lm_head[0]`; then for `i = 1..14` the row `cp.codec_embedding[i-1](code_i)` at position `i + 1` gives codebook `i + 1` from `lm_head[i]`. 16 positions per frame, causal, its own KV cache reset per frame; plain RoPE. Sampling per step with the `subtalker_*` defaults (0.9 / 50 / 1.0). (For a model whose cp hidden differs from the talker's, a `small_to_mtp_projection` Linear sits in front; it is Identity for the 0.6B and absent from its checkpoint.)
+4. Code predictor: a 2-row prefill `[h, talker.codec_embedding(cb0)]` at positions 0 and 1 gives codebook 1 from `lm_head[0]`; then for `i = 1..14` the row `cp.codec_embedding[i-1](code_i)` at position `i + 1` gives codebook `i + 1` from `lm_head[i]`. 16 positions per frame, causal, its own KV cache reset per frame; plain RoPE. Sampling per step with the `subtalker_*` defaults (0.9 / 50 / 1.0). Every one of those rows is at the talker's width and goes through `small_to_mtp_projection` first when the two widths differ (the 1.7B); for the 0.6B that stage is Identity and absent from the checkpoint. See "Code predictor".
 5. Next talker input = `codec_embedding(cb0) + Σ_i cp.codec_embedding[i](code_{i+1})` + the trailing text row.
 
 The talker's hidden fed to the code predictor is the **post-final-norm** hidden
@@ -154,8 +179,39 @@ The talker's hidden fed to the code predictor is the **post-final-norm** hidden
 | layers | 5 (same layer structure as the talker, with QK-norm) |
 | hidden / heads / KV heads / head_dim / intermediate | 1024 / 16 / 8 / 128 / 3072 |
 | rms_norm_eps, rope_theta | 1e-6, 1e6 (plain RoPE, positions 0..16 within a frame) |
-| per codebook 1..15 | `model.codec_embedding.{i}.weight` 2048 × 1024, `lm_head.{i}.weight` 2048 × 1024 |
+| per codebook 1..15 | `model.codec_embedding.{i}.weight` 2048 × **talker hidden**, `lm_head.{i}.weight` 2048 × cp hidden |
 | final norm | `model.norm.weight` |
+
+### The two widths, and `small_to_mtp_projection`
+
+The predictor's 15 input embedding tables are stored at the **talker's** width,
+not its own. That is not a quirk of the checkpoint: HF constructs the predictor
+with `embedding_dim = talker_config.hidden_size` because those same rows do
+double duty - they are also what the talker's next frame input is built from
+(`codec_hiddens.sum(1)` in the talker's forward, `assemble_step` here).
+
+So the predictor's input arrives at the talker's width and has to reach its own:
+
+- **widths equal (0.6B, both 1024):** nothing to do. HF's stage is
+  `nn.Identity()` and the two tensors are absent from the checkpoint.
+- **widths differ (1.7B, 2048 -> 1024):** `small_to_mtp_projection`, a Linear
+  with bias, applied to **every** one of the 16 positions - the talker's hidden at
+  position 0, the talker's codebook-0 embedding at 1, and each fed-back code after
+  that. Not only the prefill rows.
+
+In the engine (`model/qwen3tts/frame.hip`, `cp_embed`) each block stages
+the talker-width row into its own LDS and the projection is one grid matvec, with
+the bias folded into its write site. It needs no extra barrier, because every block
+can name the source row by itself: `codes[]` and the talker's hidden are both
+written before the barrier that already precedes the phase. `assemble_step` is
+the mirror image and works at the talker's width.
+
+A blob whose projection is missing or the wrong shape when the widths differ is
+refused at load by `validate()`, not in a kernel.
+
+`tests/reference-1.7b/cp_inputs.npy` is the float-level gate on this stage; the
+codes gate does not cover it (see that directory's README for the measurement that
+shows why).
 
 ## Speaker encoder
 
