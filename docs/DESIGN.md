@@ -273,6 +273,16 @@ measures on gfx1151: frame **32.65 ms**, vocoder 1.34 ms/frame, TTFA **171 ms**,
 RTF **0.433** (medians of 10 runs at `648a1f2`). Its own bench WAV sha is
 `4116c79d…`. Not yet measured on gfx1100.
 
+**In-context cloning costs its reference twice over**, and the second half is the one that
+is easy to miss: the reference's frames are prompt rows, so they are paid once in prefill,
+and they are also keys in every generated frame's attention. Measured on gfx1151 with a
+250-frame (20 s) reference - a 260-row prompt against 10 - medians of 10 with the two modes
+interleaved: prefill 50 -> 229 ms on the 1.7B and 17 -> 84 ms on the 0.6B, frame +8 % and
++12 %, TTFA 170 -> 358 ms, RTF 0.431 -> 0.498. **TTFA is past the 300 ms target** in that
+mode on this chip, and no cache fixes it: the target text's rows are summed into the same
+prompt rows as the reference's codes, so the prompt is per request. `docs/tuning.md` has
+the full table and the per-position frame times.
+
 Numbers go on the README front page from the bench harness, per release.
 
 **Measurement, two tools:** `GET /metrics` (Prometheus text format, llama.cpp
@@ -337,13 +347,13 @@ to `bench/results.jsonl`; the README table is generated from that file.
   while a reference's own codes and words carry its pace as well, which shows up as a
   measurably shorter utterance for the same text (below, and §7).
   **Measured, gfx1151:** all 3008 reference codes exact against PyTorch; the ICL prompt
-  is 10 + reference frames rows (198 for the bundled 15 s clip, 260 for a 20 s one)
-  against 10; and on one text and seed, with everything but the conditioning held fixed,
-  63 frames (5.04 s) in-context against 79 (6.32 s) embedding-only - 20% shorter, which
-  is that pace difference showing up inside the engine. See §7 for what it costs.
-  What it does not settle is whether the result sounds right: identity and delivery are a
-  listen test, not a measurement. This makes the comparison possible rather than
-  deciding it.
+  is 10 + reference frames rows (198 for the 15 s parity clip, 260 for a 20 s
+  reference) against 10; the engine's own A/B on one text and seed gives 63 frames
+  (5.04 s) in-context against 79 (6.32 s) embedding-only - 20% shorter, which is the
+  pace difference showing up inside the engine. §7 and `docs/tuning.md` have the cost.
+  What it does not settle is whether the result sounds right. Identity and delivery are
+  a listen test, and what this buys is the comparison itself - same weights, same text,
+  same seed, conditioning the only variable - not a verdict from it.
 - **DECIDED 2026-10-13: 1.7B-Base is supported.** Measured on gfx1151 rather than left
   as a stretch test. "Support via config is nearly free" turned out to be
   almost right: three of the four shape changes are configuration, and the fourth is
@@ -361,8 +371,8 @@ to `bench/results.jsonl`; the README table is generated from that file.
   and the spin cap are all still the 0.6B's.
 - **OPEN: which model to serve, and in which cloning mode.** 1.7B costs 1.63x per frame
   and in-context cloning costs its reference's frames on every frame's attention plus a
-  one-off prefill (§7); whether either is worth it is a listen test rather than a
-  measurement. The engine loads either
+  one-off prefill (§7, `docs/tuning.md`); whether either is worth it is a listen test,
+  not a measurement, and not a measurement. The engine loads either
   blob with no code change. Note that switching requires re-cloning stored voices: an
   embedding is the width of the model that made it and the store skips mismatches.
 - **DECIDED: streaming batches.** Vocoder batching never changes the PCM
