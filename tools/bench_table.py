@@ -8,6 +8,12 @@ that pair is the release, and the row shows the median over that hash's runs
 (ms/frame, vocoder, TTFA, RTF) and the hash. Targets without results keep
 their dashes. Runs with a "-dirty" hash are ignored (bench/README.md).
 
+Only the standard protocol is included: the bench voice (voice_1.wav) and
+embedding-only cloning. In-context rows measure a different thing - their
+prompt carries a reference clip's frames, and their utterance length depends
+on which clip - so pooling them in here would mix two measurements. They are
+compared in docs/tuning.md instead.
+
     uv run tools/bench_table.py            # rewrites README.md in place
     uv run tools/bench_table.py --check    # exit 1 if README.md is stale
 """
@@ -36,6 +42,9 @@ def rows():
     path = ROOT / "bench" / "results.jsonl"
     runs = [json.loads(l) for l in path.read_text().splitlines() if l.strip()] if path.exists() else []
     runs = [r for r in runs if not r["git"].endswith("-dirty") and r.get("rtf") is not None]
+    # the standard protocol only (see the module docstring); rows from before the `voice`
+    # field was recorded are all the bench voice, embedding-only
+    runs = [r for r in runs if r.get("clone_mode") is None and r.get("voice", "voice_1.wav") == "voice_1.wav"]
     out = ["| Target | GPU | Model | ROCm | ms/frame | Vocoder | TTFA | RTF | Build |",
            "|---|---|---|---|---|---|---|---|---|"]
     for gfx, (name, gpu) in TARGETS.items():

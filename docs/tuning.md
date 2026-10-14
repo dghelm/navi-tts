@@ -129,6 +129,53 @@ of 10 `navi-tts bench` runs, bench text at seed 2:
   so this changes nothing today; it would matter to a `blocks_per_mp` > 2
   experiment, which DESIGN §2 argues against anyway.
 
+## In-context cloning: what the conditioning costs (2026-10-13, gfx1151)
+
+Medians of 10 runs per cell, the two modes **interleaved** in one window so the session
+drift below lands on both equally, same model, same text, same seed, and the same
+reference clip (a 20 s one, 250 frames, with its own transcript - a mismatched pair makes
+the utterance length an artifact and RTF meaningless). That clip is not in this repo, so
+these rows are not in `bench/results.jsonl`; the shape reproduces with any 20 s clip and
+its exact words.
+
+| | 0.6B embedding | 0.6B in-context | 1.7B embedding | 1.7B in-context |
+|---|---|---|---|---|
+| prefill rows | 10 | **260** | 10 | **260** |
+| prefill | 16.6 ms | 84.1 ms (5.06x) | 50.2 ms | 229.4 ms (4.57x) |
+| frame | 20.05 ms | 22.47 ms (1.12x) | 32.45 ms | 35.00 ms (1.08x) |
+| frame at position 10 | 19.27 ms | 22.17 ms | 31.96 ms | 34.10 ms |
+| frame at position 50 | 20.06 ms | 22.36 ms | 32.64 ms | 34.85 ms |
+| vocoder | 1.34 ms/frame | 1.32 ms/frame | 1.28 ms/frame | 1.36 ms/frame |
+| TTFA | 97 ms | 173 ms (1.78x) | 170 ms | 358 ms (2.11x) |
+| RTF | 0.271 | 0.317 | 0.431 | 0.498 |
+| frames for the same text | 69 | 60 | 76 | 69 |
+
+- **The cost is not confined to the prefill**, which is the thing worth knowing and the
+  thing that is easy to get wrong about it. The talker attends over
+  `n_prefill + frame_index` keys, so a 250-frame reference adds 250 keys to *every*
+  frame: +12 % per frame on the 0.6B and +8 % on the 1.7B. The per-position rows are there
+  because a mean over whole utterances cannot show this - the two modes produce different
+  frame counts, so their means average over different position ranges.
+- **Why the smaller model pays more.** 250 extra keys cost the same arithmetic in both,
+  and the 0.6B's frame is 1.6x cheaper to begin with, so the same absolute cost is a
+  bigger share: +2.4 ms on 20.1 against +2.6 ms on 32.5.
+- **Prefill is ~4.6-5.1x for 26x the rows**, which is the expected shape: a 10-row prompt
+  is latency-bound (the skinny-GEMM path, `kernels.h`), a 260-row one is not, so the
+  GEMMs get most of their width back. It is also most of the extra TTFA.
+- **TTFA roughly doubles** (1.78x / 2.11x) and is the number a streaming client feels:
+  358 ms on the 1.7B against DESIGN 5.4's "under 300 ms" target, which in-context
+  cloning therefore misses on this chip. Caching will not fix it: the target text's rows
+  are summed into the same rows as the reference's codes, so the prompt is not reusable
+  across requests - only a faster prefill would help.
+- **13 % / 9 % less audio for the same text.** Not a performance number but the reason
+  for the work: conditioning on the reference makes the model follow its pace, and this
+  reference's pace is faster than either model's prior. It is also why RTF rises more than
+  the per-frame cost does - the same wall clock is spread over less audio.
+- The encoder itself costs **606 ms once per clone** for a 15 s clip (`voices add`,
+  beside the speaker encoder's ~9 ms) and 190 MB of resident VRAM. Nothing per frame.
+  It is untuned and deliberately plain; if it ever matters, `k_conv_down` and the RVQ
+  argmin are where the time is.
+
 ### Measurement regime on this box, worth knowing before trusting a number
 
 The Strix Halo box is also a desktop (compositor, browsers), and its iGPU drops to

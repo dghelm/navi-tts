@@ -189,6 +189,49 @@ int main(int argc, char ** argv) {
                     enc->chunk_frames(), frames, chunk_ok ? "identical codes" : "DIFFER",
                     repeat_ok ? "identical" : "DIFFERS");
 
+        // --- the unaligned length, which is what real references look like ----
+        // 360,000 samples is exactly 187.5 frames, and every conv's right "extra" pad comes
+        // out zero. Truncating by 777 makes all of them non-zero and stops the strides
+        // dividing the chunk lengths - the path any real reference takes (a 20 s clip is
+        // 249.75 frames).
+        bool odd_ok = true;
+        {
+            const auto want_odd = navi::Npy::load(ref + "/ref_codes_odd.npy").as_i32();
+            const auto want_odd_lat = navi::Npy::load(ref + "/ref_latents_odd.npy");
+            const std::size_t n = wav.pcm.size() - 777;
+            const std::span<const float> odd(wav.pcm.data(), n);
+            std::vector<float> got_lat;
+            enc->set_stage_hook([&](const std::string & name, const float * buf, int rows, int cols) {
+                if (name != "latents") return;
+                got_lat.resize(static_cast<std::size_t>(rows) * cols);
+                if (hipMemcpy(got_lat.data(), buf, got_lat.size() * sizeof(float), hipMemcpyDeviceToHost)
+                    != hipSuccess) {
+                    throw std::runtime_error("stage readback failed");
+                }
+            });
+            int odd_frames = 0;
+            const auto odd_codes = enc->encode(odd, &odd_frames);
+            enc->set_stage_hook(nullptr);
+            enc->set_chunk_frames(5);
+            const auto odd_chunked = enc->encode(odd);
+            enc->set_chunk_frames(0);
+            const int bad_odd = [&] {
+                int k = 0;
+                for (std::size_t i = 0; i < odd_codes.size() && i < want_odd.size(); ++i) {
+                    if (odd_codes[i] != want_odd[i]) ++k;
+                }
+                return k;
+            }();
+            const Cmp lo = got_lat.size() == want_odd_lat.as_f32().size()
+                ? compare(got_lat, want_odd_lat.as_f32()) : Cmp{0, 0, 1e9, true};
+            std::printf("  odd      %zu samples -> %d frames (reference %zu): %d codes differ, "
+                        "latents rel-rms %.2e, 5-frame chunks %s\n",
+                        n, odd_frames, want_odd.size() / static_cast<std::size_t>(G), bad_odd, lo.rel_rms,
+                        odd_chunked == odd_codes ? "identical" : "DIFFER");
+            odd_ok = bad_odd == 0 && odd_codes.size() == want_odd.size() && lo.finite && lo.rel_rms < 1e-4
+                     && odd_chunked == odd_codes;
+        }
+
         // --- negative control ----------------------------------------------
         // Move a centroid the reference actually selected far away. The argmin cannot
         // return it any more, so the codes MUST change; if they do not, the gate above is
@@ -219,7 +262,7 @@ int main(int argc, char ** argv) {
                     ctl_code, ctl_frame, perturbed != codes ? "changed (gate has teeth)" : "UNCHANGED (!)",
                     restored == codes ? "identical" : "DIFFER (!)");
 
-        const bool ok = stages_ok && codes_ok && chunk_ok && repeat_ok && control_ok;
+        const bool ok = stages_ok && codes_ok && chunk_ok && repeat_ok && odd_ok && control_ok;
         std::printf("%s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     } catch (const std::exception & ex) {
