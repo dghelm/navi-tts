@@ -42,6 +42,9 @@ writes what each engine stage is checked against:
   true, only on it being the same string the engine is given. Nothing in this set is a listen
   reference - see the README.
 
+  icl_ref_text_ids.npy    token ids of the reference transcript wrapped as its own assistant
+                          turn ("<|im_start|>assistant\n{ref}<|im_end|>\n"); the engine is given
+                          these and uses ids[3:-2]
   icl_prefill_embeds.npy  [T_icl, talker hidden] the ICL prefill input. T_icl = 9 + 1 + T_ref:
                           the 9 prefix rows of the embedding-only prompt, then codec_bos, then
                           one row per reference frame (16 code embeddings summed at the TALKER's
@@ -397,6 +400,7 @@ def main():
     # ref_text is wrapped as its own assistant turn and sliced [3:-2]; HF then lays the
     # reference transcript, the target text and tts_eos along the reference's frames.
     ref_text_ids = tts._tokenize_texts([tts._build_ref_text(a.ref_text)])[0]
+    save(out / "icl_ref_text_ids.npy", ref_text_ids[0].numpy().astype(np.int32))
     icl_lens = {}
     for tag, frames in (("icl", int(ref_codes.shape[0])), ("icl_short", a.icl_short_frames)):
         codes_in = ref_codes[:frames]
