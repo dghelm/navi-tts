@@ -163,7 +163,8 @@ TRANSFORMER_KEYS = [
 ]
 
 
-def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, codec_target: str | None = None):
+def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, codec_target: str | None = None,
+                   encoder_target: str | None = None):
     cfg = json.loads((root / "config.json").read_text())
     tk = cfg["talker_config"]
     cp = tk["code_predictor_config"]
@@ -182,7 +183,7 @@ def write_metadata(w: NaviWriter, root: Path, with_encoder: bool, target: str, c
     w.add_kv("general.converter", "navi-tts tools/convert.py format-v1")
     w.add_kv("general.has_codec_encoder", with_encoder)
     if with_encoder:
-        w.add_kv("general.codec_encoder_dtype", "f32")
+        w.add_kv("general.codec_encoder_dtype", encoder_target or "f32")
 
     for k in ("im_start_token_id", "im_end_token_id", "assistant_token_id",
               "tts_bos_token_id", "tts_eos_token_id", "tts_pad_token_id"):
@@ -288,7 +289,8 @@ def store(w: NaviWriter, st: Stats, name: str, arr: np.ndarray, target_dtype: in
     st.bytes += arr.size * np.dtype(NP_DTYPE[dtype]).itemsize
 
 
-def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: bool, codec_target: str | None = None) -> None:
+def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: bool, codec_target: str | None = None,
+            encoder_target: str | None = None) -> None:
     target_dtype = TARGET_DTYPES[target]
     codec_dtype = TARGET_DTYPES[codec_target or target]
     # The codec ENCODER is f32 whatever the rest is, and this is not a style choice: its
@@ -296,11 +298,12 @@ def convert(root: Path, out: Path, target: str, with_encoder: bool, verbose: boo
     # so f16 weights flip 1.3% of the codes (a 1e-5 tie in one codebook changes every later
     # codebook of that frame) and move the ICL prefill hidden by 1.3e-2 rel-rms - 36x the
     # talker prefill gate. It costs 190 MB and runs once per clone, never per frame.
-    # tests/reference/ref_codes_f16w.npy is the measurement. The engine reads the dtype from
-    # the tensor table, so an f16 encoder still loads.
-    encoder_dtype = DTYPE_F32
+    # tests/reference/ref_codes_f16w.npy is the measurement. The engine's encoder kernels
+    # read f32 only and refuse a blob whose encoder is anything else by name - supporting
+    # f16 there would mean shipping the precision the measurement rules out.
+    encoder_dtype = TARGET_DTYPES[encoder_target] if encoder_target else DTYPE_F32
     w = NaviWriter()
-    write_metadata(w, root, with_encoder, target, codec_target)
+    write_metadata(w, root, with_encoder, target, codec_target, encoder_target)
     for fname, tname in (("vocab.json", "tokenizer.vocab.json"), ("merges.txt", "tokenizer.merges.txt"),
                          ("tokenizer_config.json", "tokenizer.config.json")):
         add_file_bytes(w, tname, root / fname)
@@ -355,13 +358,17 @@ def main():
     ap.add_argument("--dtype", choices=sorted(TARGET_DTYPES), default="f16", help="dtype for >=2-D tensors (default f16)")
     ap.add_argument("--codec-dtype", choices=sorted(TARGET_DTYPES), default=None,
                     help="dtype for the codec's >=2-D tensors (default: same as --dtype)")
+    ap.add_argument("--encoder-dtype", choices=sorted(TARGET_DTYPES), default=None,
+                    help="dtype for the codec encoder's >=2-D tensors (default: f32, and the engine's "
+                         "encoder kernels refuse anything else by tensor name - see convert() for why "
+                         "f16 is not an option there, and use this only to test that refusal)")
     ap.add_argument("--with-encoder", action="store_true",
                     help="include the codec encoder, which is what makes reference codes for ICL "
                          "cloning (+190 MB: its weights are f32, see convert()). A blob without it "
                          "still serves voices whose codes were made elsewhere.")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
-    convert(a.model_dir, a.out, a.dtype, a.with_encoder, a.verbose, a.codec_dtype)
+    convert(a.model_dir, a.out, a.dtype, a.with_encoder, a.verbose, a.codec_dtype, a.encoder_dtype)
 
 
 if __name__ == "__main__":

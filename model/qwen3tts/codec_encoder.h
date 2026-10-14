@@ -50,8 +50,9 @@ public:
     int codebooks() const;
     double last_ms() const;          // device time of the last encode()
 
-    // Tests: called after each stage with (name, device buffer, rows, cols) - the stage
-    // names match the reference dumps ("conv", "xf", "latents").
+    // Tests: called after each stage with (name, device buffer, rows, cols). "conv", "xf"
+    // and "latents" match the reference dumps; "proj_s" and "proj_a" are the two quantiser
+    // groups' inputs, which is what a code mismatch has to be explained against.
     using StageHook = std::function<void(const std::string &, const float *, int, int)>;
     void set_stage_hook(StageHook hook);
 

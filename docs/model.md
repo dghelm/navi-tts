@@ -317,7 +317,8 @@ Three facts that are not visible in the config, each measured on this box:
   prefill's hidden state by **1.27e-2 rel-rms** - 36x the talker prefill gate. A 1.2e-5
   relative tie in codebook 6 flips that code and every later codebook of the frame then
   diverges by much more. cb0, the semantic code, never flipped at any precision tried.
-  The cost is 190 MB of VRAM and 0 ms per frame.
+  The cost is 190 MB of VRAM and 0 ms per frame. The engine's encoder kernels read f32
+  only and refuse any other dtype by tensor name, rather than quietly reinterpreting it.
   (`tests/reference/ref_codes_f16w.npy` is that measurement.)
 
 In the engine (`model/qwen3tts/codec_encoder.hip`) the conv stack is chunked in time

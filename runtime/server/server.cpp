@@ -357,6 +357,11 @@ private:
             // codec encoder the voice stays embedding-only, which is what it was before.
             if (want_codes) v.ref_codes = graph_.encode_reference(wav.pcm, &v.ref_frames);
         });
+        if (!want_codes && !ref_text.empty()) {
+            // Codes depend on the audio alone: an unchanged sample keeps the ones it has
+            // rather than losing them to a model that cannot make new ones.
+            v.ref_codes = store_.codes_for_sample(id, sha, &v.ref_frames);
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         metrics_.clones_total++;
         Metrics::add(metrics_.clone_seconds_total, ms / 1e3);

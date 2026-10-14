@@ -300,8 +300,9 @@ int cmd_synth(const Args & a) {
         spk = graph->embed_speaker(wav.pcm);
         if (!ref_text.empty()) {
             if (!graph->has_codec_encoder()) {
-                navi::fail("--ref-text needs a model converted with --with-encoder (navi-tts info --model "
-                           "says whether this one has the codec encoder)");
+                navi::fail("--ref-text needs a usable codec encoder, and this model has none: either it was "
+                           "converted without --with-encoder, or its encoder would not load and said so "
+                           "above. `navi-tts info --model` reports what the blob carries.");
             }
             ref_codes = graph->encode_reference(wav.pcm, &ref_frames);
         }
@@ -403,9 +404,18 @@ int cmd_voices(const Args & a) {
         if (!v.ref_text.empty() && graph->has_codec_encoder()) {
             v.ref_codes = graph->encode_reference(wav.pcm, &v.ref_frames);
         } else if (!v.ref_text.empty()) {
-            std::fprintf(stderr, "note: %s keeps its transcript but has no reference codes - this model has "
-                                 "no codec encoder (convert.py --with-encoder), so it will clone by speaker "
-                                 "embedding alone\n", v.id.c_str());
+            // Codes depend on the audio alone, so an unchanged sample keeps the ones it has
+            // rather than losing them to a model that cannot make new ones.
+            v.ref_codes = store.codes_for_sample(v.id, v.sample_sha256, &v.ref_frames);
+            if (v.ref_codes.empty()) {
+                std::fprintf(stderr, "note: %s keeps its transcript but has no reference codes - this model "
+                                     "has no codec encoder (convert.py --with-encoder), so it will clone by "
+                                     "speaker embedding alone\n", v.id.c_str());
+            } else {
+                std::fprintf(stderr, "note: %s keeps the %d reference frames it already had (this model has "
+                                     "no codec encoder to remake them, and the audio has not changed)\n",
+                             v.id.c_str(), v.ref_frames);
+            }
         }
         const int frames = v.ref_frames;
         store.put(std::move(v), sample);

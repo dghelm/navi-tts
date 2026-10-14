@@ -72,10 +72,18 @@ public:
 
     // Whether a stored voice already is what a clone of this sample with this transcript
     // would produce - the question "is this registration a no-op?". The sample's bytes are
-    // not enough: a voice registered before its transcript was known, or before the build
-    // could make codes, has to be re-cloned to gain ICL.
+    // not enough: a voice registered before its transcript was known has to be re-cloned to
+    // gain in-context cloning. `can_make_codes` is about the loaded model, and it only ever
+    // makes this *more* permissive: a voice that already has verified codes stays current on
+    // a model that cannot make them, because re-cloning there would throw them away.
     bool current(const std::string & id, const std::string & sample_sha256, const std::string & ref_text,
                  bool can_make_codes) const;
+
+    // The verified codes of a stored voice whose sample is exactly these bytes, else empty.
+    // Reference codes depend on the audio alone, so a clone that cannot make them - or that
+    // only needs to change the transcript - inherits them instead of dropping them.
+    std::vector<std::int32_t> codes_for_sample(const std::string & id, const std::string & sample_sha256,
+                                               int * ref_frames) const;
     bool remove(const std::string & id);                // false if absent
 
     static std::string id_for(const std::string & name);
