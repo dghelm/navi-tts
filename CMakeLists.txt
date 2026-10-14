@@ -144,6 +144,9 @@ add_executable(test_codec_encoder tests/test_codec_encoder.cpp)
 target_link_libraries(test_codec_encoder PRIVATE navi_qwen3tts navi_runtime)
 add_executable(test_icl_synth tests/test_icl_synth.cpp)
 target_link_libraries(test_icl_synth PRIVATE navi_qwen3tts navi_runtime)
+# Host-only: the voice store needs no model and no device, so it is registered once.
+add_executable(test_voice_store tests/test_voice_store.cpp)
+target_link_libraries(test_voice_store PRIVATE navi_runtime)
 
 # navi_add_gates(<suffix> <model.navi> <reference dir>)
 function(navi_add_gates suffix model ref)
@@ -158,6 +161,7 @@ function(navi_add_gates suffix model ref)
     add_test(NAME icl_synth${suffix} COMMAND test_icl_synth "${model}" "${ref}")
 endfunction()
 
+add_test(NAME voice_store COMMAND test_voice_store "${CMAKE_BINARY_DIR}/voice_store_test")
 navi_add_gates("" "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
 if(EXISTS "${NAVI_TEST_MODEL_17B}" AND EXISTS "${NAVI_TEST_REFERENCE_17B}/manifest.json")
     navi_add_gates("-1.7b" "${NAVI_TEST_MODEL_17B}" "${NAVI_TEST_REFERENCE_17B}")

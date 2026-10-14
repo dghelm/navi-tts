@@ -4,6 +4,7 @@
 #include "runtime/weights/navi_file.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 
 namespace navi::qwen3tts {
@@ -46,8 +47,19 @@ std::unique_ptr<Graph> Graph::load(const Device & dev, const std::string & navi_
     I.vocoder = Vocoder::create(dev, file, *I.weights, I.params, vocoder_chunk);
     I.speaker = SpeakerEncoder::create(dev, *I.weights, I.params);
     // The encoder is what *makes* reference codes; a blob without it still serves voices
-    // whose codes were made by one that has it.
-    if (with_encoder) I.codec_encoder = CodecEncoder::create(dev, file, *I.weights, I.params);
+    // whose codes were made by one that has it. So a blob whose encoder this build cannot
+    // use (the wrong dtype, say) loses in-context *cloning* and nothing else: it is reported
+    // and the model still serves, rather than refusing to load over a component that only
+    // one operation needs. An explicit ICL request then fails with the encoder's own message.
+    if (with_encoder) {
+        try {
+            I.codec_encoder = CodecEncoder::create(dev, file, *I.weights, I.params);
+        } catch (const std::exception & ex) {
+            std::fprintf(stderr, "%s: the codec encoder will not load, so this model cannot make reference "
+                                 "codes for in-context cloning (it still serves voices that have them): %s\n",
+                         navi_path.c_str(), ex.what());
+        }
+    }
     file.close();
     return g;
 }

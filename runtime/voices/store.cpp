@@ -321,10 +321,18 @@ bool Store::current(const std::string & id, const std::string & sample_sha256, c
                     bool can_make_codes) const {
     const VoicePtr v = find(id);
     if (!v || v->sample_sha256 != sample_sha256 || v->ref_text != ref_text) return false;
-    // A voice with a transcript should have codes when this build can make them; if it does
-    // not, re-cloning is what turns ICL on for it.
-    const bool wants_codes = !ref_text.empty() && can_make_codes;
-    return wants_codes == v->icl();
+    if (v->icl()) return true;   // already has codes; this model's encoder is irrelevant
+    // No codes yet: re-cloning gains them only if there is a transcript to use and a model
+    // that can make them. Otherwise there is nothing to gain and this is a no-op.
+    return !(!ref_text.empty() && can_make_codes);
+}
+
+std::vector<std::int32_t> Store::codes_for_sample(const std::string & id, const std::string & sample_sha256,
+                                                  int * ref_frames) const {
+    const VoicePtr v = find(id);
+    if (!v || v->sample_sha256 != sample_sha256 || !v->icl()) return {};
+    if (ref_frames) *ref_frames = v->ref_frames;
+    return v->ref_codes;
 }
 
 bool Store::remove(const std::string & id) {

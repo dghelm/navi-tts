@@ -413,7 +413,19 @@ std::unique_ptr<CodecEncoder> CodecEncoder::create(const Device & dev, const Nav
     const Params::CodecEncoder & e = I.e;
     const int L = e.latent, HD = e.n_head * e.head_dim;
     const std::string pre = "codec.encoder.";
-    auto f32 = [&](const std::string & n) { return w.get(n).as<float>(); };
+    // Every kernel here reads f32, and the converter stores this component f32 for a
+    // measured reason (docs/model.md "Codec encoder"). A blob whose encoder is some other
+    // dtype is refused by name rather than reinterpreted: `as<float>()` only casts the
+    // pointer, so an f16 tensor would be read as half as many wrong values and off its end.
+    auto f32 = [&](const std::string & n) {
+        const DeviceTensor & t = w.get(n);
+        if (t.info.dtype != DType::F32) {
+            fail("codec encoder: " + n + " is " + std::string(dtype_name(t.info.dtype))
+                 + " and every kernel in this component reads f32; convert with --with-encoder, which "
+                 "stores it f32 (tools/convert.py says why)");
+        }
+        return t.as<float>();
+    };
 
     // the conv stack, at the layer indices params.cpp lists
     int idx = 0, dim = e.num_filters;
@@ -702,6 +714,10 @@ std::vector<std::int32_t> CodecEncoder::encode(std::span<const float> wav, int *
     I.snap("latents", I.lat, frames, L);
     I.run_conv(I.proj_s, PRO_NONE, EPI_NONE, I.lat, frames, frames, 0, I.ls);
     I.run_conv(I.proj_a, PRO_NONE, EPI_NONE, I.lat, frames, frames, 0, I.la);
+    // The two quantiser inputs, so a test that sees a code mismatch can replay the cascade
+    // on the host and say whether it was a near-tie or an error.
+    I.snap("proj_s", I.ls, frames, e.vq_dim);
+    I.snap("proj_a", I.la, frames, e.vq_dim);
     const std::size_t rvq_lds = static_cast<std::size_t>(e.vq_dim) * sizeof(float)
                                 + NT * sizeof(float) + NT * sizeof(int);
     k_rvq_encode<<<static_cast<unsigned>(frames), NT, rvq_lds, I.stream>>>(
