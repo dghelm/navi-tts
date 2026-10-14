@@ -5,3 +5,5 @@ tools/.venv/
 __pycache__/
 *.tmp
 .claude/
+# listen sets and other generated audio: made in the tree, handed over for placement
+out/

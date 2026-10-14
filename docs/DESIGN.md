@@ -56,7 +56,12 @@ model family is a second `model/` module (section 5), not a rewrite of the runti
   no fallback here: a barrier timeout fails the *request*, cleanly, and the next
   request starts fresh. The kernel must never be able to hang the box.
 - **Bound every request.** `max_audio_tokens` per request (default 600 = 48 s),
-  vocoder decoded in fixed-size chunks so scratch never scales with length.
+  vocoder decoded in fixed-size chunks so scratch never scales with length. The
+  cap is also *clamped* to the KV positions the prompt leaves
+  (`max_positions - prefill_rows`: 2038 frames = 163 s for an embedding-only
+  prompt, 1788 for one carrying a 20 s in-context reference) and reported as
+  `hit_cap`. Before that clamp a 4096-frame request streamed 163 s of audio and
+  then failed on "KV cache full"; it is now decided before the prompt runs.
 - **Vocoder convs need a real kernel.** The naive transposed conv ran at 430 ms
   per frame on HIP under ggml; the O(K) rewrite made it ~1.2 ms. Write it right
   the first time.
@@ -151,6 +156,7 @@ navi-tts/
 ├── model/qwen3tts/     per architecture
 │   ├── tokenizer       BPE
 │   ├── speaker         ECAPA-TDNN
+│   ├── codec_encoder   Mimi encoder -> reference codes (in-context cloning; once per clone)
 │   ├── prefill         batched talker pass
 │   ├── frame.hip       the persistent cooperative frame kernel (talker step → cb0 sample → 15 cp steps)
 │   ├── vocoder         transformer + convs, chunked, state threaded for streaming
@@ -233,9 +239,18 @@ engine change.
 3. **Regression**: `cmp` on the WAV for the bench text at a pinned seed after
    every change; a difference is either an intended arithmetic change (then one
    seed re-audition, documented) or a bug.
-4. **Contention test**: a GPU hog process alongside; zero timeouts over a day of
+4. **Codec encoder** (in-context cloning): per-stage float gates (conv stack,
+   transformer, latents) and then the codes **exactly**, cb0 included - a
+   nearest-centroid search is not something to gate with a tolerance, and a
+   mismatch is reported with both centroids' distances rather than tolerated.
+   A chunked encode must equal a one-shot one, encoding twice must give the same
+   codes, and a negative control moves a centroid the reference actually selected
+   so the gate is known to have teeth. The reference *prompt* is gated separately,
+   with the codes injected from the dumps, so a prompt failure cannot hide behind
+   an encoder failure and the prompt gate needs no encoder in the blob.
+5. **Contention test**: a GPU hog process alongside; zero timeouts over a day of
    journal is the bar for any occupancy change.
-5. **Runaway test**: temperature 0.9, random seed, long text, `max_audio_tokens`
+6. **Runaway test**: temperature 0.9, random seed, long text, `max_audio_tokens`
    cap — must end at the cap, must not grow memory.
 
 ## 7. Performance targets
@@ -309,20 +324,28 @@ to `bench/results.jsonl`; the README table is generated from that file.
   vocoder batch's PCM) and the response's content-provider callback (writes
   chunks as they arrive); a client that stops reading fails the request rather
   than stalling the GPU worker.
-- **OPEN: ICL cloning (tokenizer encoder) - now the top quality item.** Voices
-  registered with `ref_text` use in-context cloning and need the audio
-  *encoder*; without it, cloning is speaker-embedding only (what runs today). The
-  encoder is a fourth model component (Conv1D + 8-layer transformer + RVQ).
-  Why it moved up: in a blind listen (2026-10, three clones of the owner's voice) the
-  owner twice picked an **ICL-conditioned 1.7B PyTorch** clone over this engine's
-  **embedding-only 0.6B**, as "much less like me". That comparison varied model size
-  *and* conditioning mode together, so it attributes the preference to neither - but
-  it does say identity, not speed, is where this engine is behind. With 1.7B now
-  supported, the clean experiment is available for the first time: the same weights
-  under both conditioning modes. A loudness-matched 1.7B-vs-0.6B set (both
-  embedding-only, so size is the only variable) is the first half of it.
-  Recommendation: this, not further RTF work, is the next quality lever. RTF is not
-  the finish line.
+- **DECIDED 2026-10-13: in-context cloning is supported.** The codec audio encoder is
+  ported (`model/qwen3tts/codec_encoder.hip`, a Mimi encoder: conv stack, 8-layer
+  transformer, split RVQ), so a voice registered with a transcript is cloned from the
+  pair (audio, transcript) instead of from a speaker embedding alone. `docs/model.md`
+  has the prompt layout and the three facts that are not in the config - the attention
+  is full causal although the config declares a 250 window, one conv pads by
+  replicating, and the encoder's weights have to be f32 because an RVQ argmin cascade
+  has no error averaging (f16 moves the ICL prefill hidden 36x the talker prefill gate).
+  Why it was the top quality item: in a blind listen (2026-10, three clones of the
+  owner's voice) the owner twice picked an **ICL-conditioned 1.7B PyTorch** clone over
+  this engine's **embedding-only 0.6B**, as "much less like me", and on the same twelve
+  sentences that clone speaks them in 79.4 s against this engine's 93.8 s - so the
+  identity complaint and the pace complaint were one missing feature.
+  **Measured, gfx1151:** all 3008 reference codes exact against PyTorch; the ICL prompt
+  is 10 + reference frames rows (198 for the 15 s parity clip, 260 for the owner's 20 s
+  reference) against 10; the engine's own A/B on one text and seed gives 63 frames
+  (5.04 s) in-context against 79 (6.32 s) embedding-only - 20% shorter, which is the
+  pace difference showing up inside the engine. See §7 for the cost.
+  What it does NOT settle: whether this closes the gap to the PyTorch clone. That clone
+  differs from this engine in implementation as well as conditioning, so the only clean
+  claim here is the one the A/B set makes - same weights, same sentences, same seed,
+  conditioning the only variable. The listen test is the owner's.
 - **DECIDED 2026-10-13: 1.7B-Base is supported.** Called by the owner, measured on
   gfx1151, not a stretch test. "Support via config is nearly free" turned out to be
   almost right: three of the four shape changes are configuration, and the fourth is
@@ -338,8 +361,10 @@ to `bench/results.jsonl`; the README table is generated from that file.
   of the frame. It is inside this chip's RTF 0.5 usefulness bar, with no tuning pass
   yet. Tuning is still not free and has not been done: `MV_ROWS`, the grid
   and the spin cap are all still the 0.6B's.
-- **OPEN: which model to serve.** 1.7B costs 1.63x per frame; whether it is worth that
-  is a listen test, not a measurement, and the owner's call. The engine loads either
+- **OPEN: which model to serve, and in which cloning mode.** 1.7B costs 1.63x per frame
+  and in-context cloning costs its reference's frames on every frame's attention plus a
+  one-off prefill (§7); whether either is worth it is a listen test, not a
+  measurement, and the owner's call. The engine loads either
   blob with no code change. Note that switching requires re-cloning stored voices: an
   embedding is the width of the model that made it and the store skips mismatches.
 - **DECIDED: streaming batches.** Vocoder batching never changes the PCM

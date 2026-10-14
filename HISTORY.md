@@ -655,3 +655,105 @@ cache's `max_pos`. The two were safe only because `VEC_MAX` happened to
 exceed `Talker`'s default `max_positions`, a coupling across two files that
 nothing enforced; raising `max_positions` past 4096 would have corrupted LDS
 instead of failing.
+
+## 2026-10-13 - in-context cloning: the codec audio encoder
+
+DESIGN §9 had this as the top quality item, on the strength of a blind listen: the owner
+twice picked an ICL-conditioned 1.7B PyTorch clone over this engine's embedding-only
+clone, as "much less like me". The follow-up number was the one that made it a feature
+rather than a preference - on the same twelve sentences that clone speaks them in 79.4 s
+against the engine's 93.8 s, so "sounds less like me" and "paces it wrong" were one
+missing input, not two.
+
+**What was missing.** ICL conditions on a reference clip's *codes* plus its *transcript*.
+The engine had the transcript (the voice store has kept `ref_text` since M2) and no
+way to make codes: the codec encoder was never converted. So the work is a fourth model
+component plus a second prompt layout.
+
+**Three things the config does not tell you**, each measured before any code was written,
+and each would have produced plausible-looking wrong output:
+
+- The encoder transformer's config says `sliding_window: 250` and transformers
+  4.57.3 never applies it. Setting it to 8, 64 or `None` changes the output by
+  exactly 0.0, and a hand-rolled full-causal layer matches at 2.4e-7 rel-rms where a
+  windowed one is off by 1.7e-2. The engine attends over the whole clip.
+- `downsample` is the one conv in this model built with `pad_mode="replicate"`:
+  it pads by repeating a row, on both sides. Zero-filled history would have been wrong at
+  the clip's start and at its odd tail.
+- **f16 weights are not good enough here, and that is not a precision preference.**
+  Rounding the encoder the way `convert.py` stores everything else changes 38 of
+  3008 codes, which moves the ICL prefill's hidden state by 1.27e-2 rel-rms - 36x the
+  talker prefill gate. An RVQ is a cascade of argmins with no error averaging: a 1.2e-5
+  relative tie in codebook 6 flips that code, and every later codebook of that frame then
+  diverges by much more. Splitting the test showed the stack and the codebooks both
+  contribute (33 flips and 10), so f32 codebooks alone would not have fixed it. The
+  encoder is stored f32: 190 MB of VRAM, zero per frame, because it runs once per clone.
+  cb0, the semantic code, never flipped at any precision tried.
+
+**The shape of the port.** Only the conv stack is chunked in time - its first level is
+184 MB at the 30 s clip cap - with each conv's causal history threaded across chunks, and
+chunk boundaries at whole frames so every stage's chunk length is a whole number of rows
+and the right-hand padding stays where the reference puts it. Everything after it runs
+once over the whole sequence: 375 rows x 512 is 1.5 MB, so the transformer needs no KV
+cache, no ring and no cross-chunk state, and full causal attention is then exact by
+construction. That was a revision: the first plan chunked the transformer too, which
+would have needed a new attention kernel *and* a 24.6 MB cache (I had also sized that
+cache at the wrong frame rate - the transformer runs before the downsample, at 25 Hz).
+
+The vocoder's attention kernel could not be reused either way: it keeps its scores in
+`__shared__ float sc[128]` and assigns one key per thread, which is correct only up
+to its own 72-wide window. The encoder's is a plain full-causal kernel with the clip
+bounded against its LDS vector.
+
+**The prompt.** The nine-row prefix is unchanged; what was one row (first text token +
+`codec_bos`) becomes `1 + T_ref` rows, each reference frame's 16 code
+embeddings summed at the talker's width - the same rows `assemble_step` already
+sums, which is why the predictor's tables are stored at that width (the 1.7B milestone's
+finding, paying off). The text side is the reference transcript, the target text and
+`tts_eos` laid along those rows, padded with `tts_pad`; the overflow becomes
+the trailing rows, so a long reference puts the whole text in the prompt and a short one
+does not. One new kernel; the frame kernel, the KV layout and the vocoder are untouched,
+and the embedding-only path's bench WAV sha is unchanged (`4cb7232a…`).
+
+**What it costs is not confined to the prefill**, which I had claimed in the first plan
+and withdrew: the talker attends over `n_prefill + frame_index` keys, so a
+250-frame reference adds 250 keys to *every* frame. The bench now reports per-position
+frame times, interleaved between the two modes so the session's clock drift lands on both
+equally.
+
+**A latent failure that was not about ICL at all.** A 4096-frame request used to stream
+163 s of audio and then fail on "KV cache full": nothing checked the prompt against the
+cache before generating. ICL makes that budget smaller, so the budget is now decided up
+front - `max_frames` is clamped to the positions the prompt leaves, reported as
+`hit_cap`, and a prompt that does not fit at all is refused before any upload.
+
+**The voice store's idempotency was wrong for this.** It returned "exists" on a matching
+sample hash alone, so re-registering a voice with a transcript - or correcting one - was a
+no-op and ICL could never switch on. It now compares the transcript and the stored ICL
+state too. Payload hashes went into the manifest at the same time, because the manifest
+is written last: a crash mid-replacement now leaves a manifest describing the old
+payloads and the mismatch is caught at load (the voice is skipped, or demoted to
+embedding-only). That is detection, not a transaction, and the header says so rather than
+implying more; a manifest from an older build is upgraded in place before its payloads
+are touched, which closes the one window where a new payload could hide under an old
+manifest.
+
+**Gates.** The encoder is gated stage by stage (conv stack, transformer, latents, within
+7.5e-6 rel-rms) and then on the codes **exactly** - all 3008, cb0 included. A
+nearest-centroid search is not something to gate with a tolerance, and a mismatch is
+reported with both centroids' distances rather than tolerated. Chunked equals one-shot
+equals 5-frame chunks; encoding twice is identical. The prompt is gated separately with
+the codes injected from the dumps, so it needs no encoder in the blob - which is also the
+case a voice cloned on one box and served on another exercises, and the codes are
+portable because the codec is the same checkpoint in every model of this family.
+
+The negative control earned its keep on the first run: it reported the codes UNCHANGED
+after moving a centroid the reference had selected, while the encoder was in fact
+correct. The test was perturbing the weight arena, and the encoder reads its own copy of
+the codebooks (it copies them when the arena does not hold them adjacent). A control that
+cannot fail proves nothing, and this one failed for the right reason.
+
+Also fixed on the way past: every reference dump is now saved C-contiguous. A transposed
+torch tensor's `.numpy()` is a Fortran-order view and `np.save` records that,
+which the engine's `Npy` reader refuses - `ref_codes.npy` had been unreadable
+since the day it was first dumped, and nothing had read it until now.

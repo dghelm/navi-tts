@@ -17,6 +17,11 @@ writes what each engine stage is checked against:
   ref_latents.npy         [T, 512] after the stride-2 downsample - the last float before any
                           argmin, and the encoder's float gate. T = ceil(T25 / 2).
   ref_codes.npy           [T, 16] the codec encoder's codes for the reference audio (ICL)
+  ref_codes_odd.npy       the same for the clip truncated by 777 samples, so its length is not a
+  ref_latents_odd.npy     multiple of the frame size: every conv then gets a non-zero right pad
+                          and the strides stop dividing the chunk lengths. Real references are
+                          this shape (the owner's 20 s clip is 249.75 frames), and the aligned
+                          clip never takes that path.
   ref_codes_f16w.npy      the same codes with every >=2-D encoder weight rounded to f16 the way
                           convert.py stores the rest of the model. NOT a gate: it documents why
                           the encoder is stored f32 (manifest ref_codes_f16w_diff). An RVQ is a
@@ -310,6 +315,17 @@ def main():
     save(out / "ref_conv.npy", stages["conv"])
     save(out / "ref_xf.npy", stages["xf"])
     save(out / "ref_latents.npy", stages["latents"])
+    # The same clip truncated to a length that is NOT a multiple of the frame size, which is
+    # the usual case for real audio (the owner's 20 s reference is 479,520 samples = 249.75
+    # frames). Every conv then gets a non-zero right "extra" pad computed from the full
+    # length, and the strides stop dividing the chunk lengths - a path the aligned clip never
+    # takes. Codes and latents only; the engine has the full set for the aligned case.
+    odd = wav[: wav.shape[0] - 777]
+    odd_stages = encoder_stages(stm, odd)
+    save(out / "ref_codes_odd.npy", odd_stages["codes"])
+    save(out / "ref_latents_odd.npy", odd_stages["latents"])
+    print(f"unaligned case: {odd.shape[0]} samples -> {odd_stages['conv'].shape[0]} rows at 25 Hz -> "
+          f"{odd_stages['codes'].shape[0]} frames", file=sys.stderr)
     print(f"codec encoder: {wav.shape[0]} samples -> {stages['conv'].shape[0]} rows at 25 Hz -> "
           f"{ref_codes.shape[0]} frames x {ref_codes.shape[1]} codebooks", file=sys.stderr)
 
@@ -498,6 +514,8 @@ def main():
         "greedy_frames": int(greedy.shape[0]),
         "ref_frames": int(ref_codes.shape[0]),
         "ref_conv_rows": int(stages["conv"].shape[0]),
+        "ref_odd_samples": int(wav.shape[0] - 777),
+        "ref_odd_frames": int(odd_stages["codes"].shape[0]),
         "ref_codes_f16w_diff": f16w_diff,
         "ref_codes_f16w_note": "documentation, not a gate: f16 encoder weights move the ICL "
                                "prefill hidden by 1.3e-2 rel-rms, so the engine stores the "
