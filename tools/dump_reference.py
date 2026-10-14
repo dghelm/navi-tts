@@ -140,6 +140,16 @@ TOKENIZER_CASES = [
 ]
 
 
+def save(path: Path, arr: np.ndarray) -> None:
+    """np.save, but always C-contiguous.
+
+    A transposed torch tensor's .numpy() is a Fortran-order view, and np.save records that
+    in the header - which the engine's Npy reader refuses, rightly: nothing in this repo
+    wants two layouts. Several dumps are transposes, so every save goes through here.
+    """
+    np.save(path, np.ascontiguousarray(arr))
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -200,10 +210,10 @@ def write_vocoder_refs(model, sampled: np.ndarray, out: Path) -> np.ndarray:
     codes = torch.from_numpy(sampled).long()
     wavs, fs = st.decode([{"audio_codes": codes}])
     pcm = np.asarray(wavs[0], dtype=np.float32)
-    np.save(out / "sampled_pcm.npy", pcm)
+    save(out / "sampled_pcm.npy", pcm)
     sf.write(out / "sampled.wav", pcm, fs, subtype="PCM_16")
     wavs16, _ = st.decode([{"audio_codes": codes[:16]}])
-    np.save(out / "vocoder16_pcm.npy", np.asarray(wavs16[0], dtype=np.float32))
+    save(out / "vocoder16_pcm.npy", np.asarray(wavs16[0], dtype=np.float32))
 
     # f16-rounded weights, exactly as tools/convert.py stores them: every >=2-D
     # tensor, with the EMA codebooks baked first and then rounded.
@@ -216,7 +226,7 @@ def write_vocoder_refs(model, sampled: np.ndarray, out: Path) -> np.ndarray:
             usage = m.cluster_usage.clamp(min=m.epsilon)[:, None]
             m.embedding_sum.data = (m.embedding_sum / usage).half().float() * usage
     pcm16w = dec(codes.T.unsqueeze(0))[0, 0].numpy().astype(np.float32)
-    np.save(out / "sampled_pcm_f16w.npy", pcm16w)
+    save(out / "sampled_pcm_f16w.npy", pcm16w)
     return pcm
 
 
@@ -269,7 +279,7 @@ def main():
     # --- tokenizer ---------------------------------------------------------
     prompt_text = tts._build_assistant_text(a.text)
     text_ids = tts._tokenize_texts([prompt_text])[0]          # [1, 3 + T + 5]
-    np.save(out / "text_ids.npy", text_ids[0].numpy().astype(np.int32))
+    save(out / "text_ids.npy", text_ids[0].numpy().astype(np.int32))
     cases = {s: tts._tokenize_texts([s])[0][0].tolist() for s in TOKENIZER_CASES + [a.text]}
     (out / "tokenizer_cases.json").write_text(json.dumps(cases, ensure_ascii=False, indent=1))
 
@@ -282,21 +292,21 @@ def main():
     wav = load_wav(voice, sr)
     mels = mel_spectrogram(torch.from_numpy(wav).unsqueeze(0), n_fft=1024, num_mels=128, sampling_rate=sr,
                            hop_size=256, win_size=1024, fmin=0, fmax=12000)   # [1, n_mels, T]
-    np.save(out / "speaker_mels.npy", mels[0].numpy().astype(np.float32))
+    save(out / "speaker_mels.npy", mels[0].numpy().astype(np.float32))
     spk = model.extract_speaker_embedding(audio=wav, sr=sr)                  # [1024]
-    np.save(out / "speaker_embedding.npy", spk.numpy().astype(np.float32))
+    save(out / "speaker_embedding.npy", spk.numpy().astype(np.float32))
     print(f"speaker embedding: {tuple(spk.shape)}, mels {tuple(mels.shape)}", file=sys.stderr)
 
     # --- codec encoder: the reference codes, and every stage behind them --------
     stm = model.speech_tokenizer.model                      # Qwen3TTSTokenizerV2Model
     ref_codes = model.speech_tokenizer.encode(wav, sr=sr).audio_codes[0]   # [T, 16], authoritative
-    np.save(out / "ref_codes.npy", ref_codes.numpy().astype(np.int32))
+    save(out / "ref_codes.npy", ref_codes.numpy().astype(np.int32))
     stages = encoder_stages(stm, wav)
     if not np.array_equal(stages["codes"], ref_codes.numpy()):
         raise SystemExit("the stage walk does not reproduce speech_tokenizer.encode's codes")
-    np.save(out / "ref_conv.npy", stages["conv"])
-    np.save(out / "ref_xf.npy", stages["xf"])
-    np.save(out / "ref_latents.npy", stages["latents"])
+    save(out / "ref_conv.npy", stages["conv"])
+    save(out / "ref_xf.npy", stages["xf"])
+    save(out / "ref_latents.npy", stages["latents"])
     print(f"codec encoder: {wav.shape[0]} samples -> {stages['conv'].shape[0]} rows at 25 Hz -> "
           f"{ref_codes.shape[0]} frames x {ref_codes.shape[1]} codebooks", file=sys.stderr)
 
@@ -332,24 +342,24 @@ def main():
     mask = captured["attention_mask"]            # [1, T]
     trailing = captured["trailing_text_hidden"]  # [1, n, 1024]
     pad = captured["tts_pad_embed"]              # [1, 1, 1024]
-    np.save(out / "prefill_embeds.npy", embeds[0].numpy().astype(np.float32))
-    np.save(out / "prefill_mask.npy", mask[0].numpy().astype(np.int32))
-    np.save(out / "trailing_text.npy", trailing[0].numpy().astype(np.float32))
-    np.save(out / "tts_pad_embed.npy", pad[0, 0].numpy().astype(np.float32))
+    save(out / "prefill_embeds.npy", embeds[0].numpy().astype(np.float32))
+    save(out / "prefill_mask.npy", mask[0].numpy().astype(np.int32))
+    save(out / "trailing_text.npy", trailing[0].numpy().astype(np.float32))
+    save(out / "tts_pad_embed.npy", pad[0, 0].numpy().astype(np.float32))
 
     greedy = codes_list[0].numpy().astype(np.int32)          # [n_frames, 16]
-    np.save(out / "greedy_codes.npy", greedy)
-    np.save(out / "frame0_codes.npy", greedy[0])
+    save(out / "greedy_codes.npy", greedy)
+    save(out / "frame0_codes.npy", greedy[0])
 
     # --- prefill on its own: hidden, logits, KV, positions ----------------------
     talker.rope_deltas = None
     pre = talker(inputs_embeds=embeds, attention_mask=mask, use_cache=True, output_hidden_states=True)
     hidden_last = pre.past_hidden[0, -1]                     # post-norm, what feeds codec_head and the cp
     logits_last = pre.logits[0, -1]
-    np.save(out / "prefill_hidden.npy", hidden_last.numpy().astype(np.float32))
-    np.save(out / "prefill_logits.npy", logits_last.numpy().astype(np.float32))
+    save(out / "prefill_hidden.npy", hidden_last.numpy().astype(np.float32))
+    save(out / "prefill_logits.npy", logits_last.numpy().astype(np.float32))
     position_ids, _ = talker.get_rope_index(mask)
-    np.save(out / "prefill_position_ids.npy", position_ids[:, 0].numpy().astype(np.int32))
+    save(out / "prefill_position_ids.npy", position_ids[:, 0].numpy().astype(np.int32))
 
     # --- the code predictor's inputs for frame 0 (the projection gate) ----------
     # Assembled the way Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.forward
@@ -362,7 +372,7 @@ def main():
     for pos in range(2, tcfg.num_code_groups):
         cp_rows.append(cpm.get_input_embeddings()[pos - 2](torch.tensor([int(greedy[0, pos - 1])])))
     cp_inputs = cpm.small_to_mtp_projection(torch.cat(cp_rows, dim=0))
-    np.save(out / "cp_inputs.npy", cp_inputs.numpy().astype(np.float32))
+    save(out / "cp_inputs.npy", cp_inputs.numpy().astype(np.float32))
     print(f"cp inputs: {tuple(cp_inputs.shape)}, projection "
           f"{type(cpm.small_to_mtp_projection).__name__}", file=sys.stderr)
     kv = {}
@@ -408,8 +418,8 @@ def main():
         icl_embeds = captured["inputs_embeds"]
         icl_mask = captured["attention_mask"]
         icl_trailing = captured["trailing_text_hidden"]
-        np.save(out / f"{tag}_prefill_embeds.npy", icl_embeds[0].numpy().astype(np.float32))
-        np.save(out / f"{tag}_trailing_text.npy", icl_trailing[0].numpy().astype(np.float32))
+        save(out / f"{tag}_prefill_embeds.npy", icl_embeds[0].numpy().astype(np.float32))
+        save(out / f"{tag}_trailing_text.npy", icl_trailing[0].numpy().astype(np.float32))
         icl_lens[tag] = dict(ref_frames=frames, prefill_len=int(icl_embeds.shape[1]),
                              trailing_len=int(icl_trailing.shape[1]))
         print(f"{tag}: {frames} reference frames -> {icl_embeds.shape[1]} prefill rows, "
@@ -418,21 +428,21 @@ def main():
         if tag != "icl":
             continue
         icl_greedy = icl_codes_list[0].numpy().astype(np.int32)
-        np.save(out / "icl_greedy_codes.npy", icl_greedy)
-        np.save(out / "icl_frame0_codes.npy", icl_greedy[0])
+        save(out / "icl_greedy_codes.npy", icl_greedy)
+        save(out / "icl_frame0_codes.npy", icl_greedy[0])
         icl_lens[tag]["greedy_frames"] = int(icl_greedy.shape[0])
         talker.rope_deltas = None
         icl_pre = talker(inputs_embeds=icl_embeds, attention_mask=icl_mask, use_cache=True,
                          output_hidden_states=True)   # same call as the embedding-only prefill; its KV is not dumped
-        np.save(out / "icl_prefill_hidden.npy", icl_pre.past_hidden[0, -1].numpy().astype(np.float32))
-        np.save(out / "icl_prefill_logits.npy", icl_pre.logits[0, -1].numpy().astype(np.float32))
+        save(out / "icl_prefill_hidden.npy", icl_pre.past_hidden[0, -1].numpy().astype(np.float32))
+        save(out / "icl_prefill_logits.npy", icl_pre.logits[0, -1].numpy().astype(np.float32))
         torch.manual_seed(a.seed)
         t5 = time.time()
         icl_sampled_list, _ = model.generate(
             input_ids=[text_ids], ref_ids=[ref_text_ids], voice_clone_prompt=icl_prompt,
             languages=[a.language], non_streaming_mode=False, max_new_tokens=a.sampled_max_frames)
         icl_sampled = icl_sampled_list[0].numpy().astype(np.int32)
-        np.save(out / "icl_sampled_codes.npy", icl_sampled)
+        save(out / "icl_sampled_codes.npy", icl_sampled)
         icl_lens[tag]["sampled_frames"] = int(icl_sampled.shape[0])
         print(f"icl sampled run: {icl_sampled.shape[0]} frames in {time.time() - t5:.1f}s",
               file=sys.stderr)
@@ -445,7 +455,7 @@ def main():
         non_streaming_mode=False, max_new_tokens=a.sampled_max_frames,
     )
     sampled = sampled_list[0].numpy().astype(np.int32)
-    np.save(out / "sampled_codes.npy", sampled)
+    save(out / "sampled_codes.npy", sampled)
     print(f"sampled run: {sampled.shape[0]} frames in {time.time() - t2:.1f}s", file=sys.stderr)
 
     # --- vocoder ----------------------------------------------------------------
@@ -456,7 +466,7 @@ def main():
     # --- what f16 encoder weights would do (documentation, not a gate) ----------
     n16 = f16_round_encoder(stm)
     codes_f16w = model.speech_tokenizer.encode(wav, sr=sr).audio_codes[0].numpy().astype(np.int32)
-    np.save(out / "ref_codes_f16w.npy", codes_f16w)
+    save(out / "ref_codes_f16w.npy", codes_f16w)
     f16w_diff = int((codes_f16w != ref_codes.numpy()).sum())
     print(f"f16 encoder weights ({n16} tensors): {f16w_diff} of {ref_codes.numel()} codes differ",
           file=sys.stderr)
