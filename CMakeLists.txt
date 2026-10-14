@@ -107,7 +107,8 @@ add_library(navi_qwen3tts STATIC
     model/qwen3tts/tokenizer.cpp
     model/qwen3tts/graph.cpp
 )
-navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip model/qwen3tts/speaker.hip)
+navi_hip_sources(navi_qwen3tts model/qwen3tts/vocoder.hip model/qwen3tts/talker.hip model/qwen3tts/frame.hip
+                 model/qwen3tts/speaker.hip model/qwen3tts/codec_encoder.hip)
 target_link_libraries(navi_qwen3tts PUBLIC navi_runtime)
 
 add_library(navi_server STATIC runtime/server/server.cpp)
@@ -139,6 +140,8 @@ add_executable(test_frame tests/test_frame.cpp)
 target_link_libraries(test_frame PRIVATE navi_qwen3tts navi_runtime)
 add_executable(test_speaker tests/test_speaker.cpp)
 target_link_libraries(test_speaker PRIVATE navi_qwen3tts navi_runtime)
+add_executable(test_codec_encoder tests/test_codec_encoder.cpp)
+target_link_libraries(test_codec_encoder PRIVATE navi_qwen3tts navi_runtime)
 
 # navi_add_gates(<suffix> <model.navi> <reference dir>)
 function(navi_add_gates suffix model ref)
@@ -147,6 +150,8 @@ function(navi_add_gates suffix model ref)
     add_test(NAME prefill${suffix} COMMAND test_prefill "${model}" "${ref}")
     add_test(NAME frame${suffix} COMMAND test_frame "${model}" "${ref}")
     add_test(NAME speaker${suffix} COMMAND test_speaker "${model}" "${ref}")
+    # Skips itself (exit 0) on a blob converted without --with-encoder.
+    add_test(NAME codec_encoder${suffix} COMMAND test_codec_encoder "${model}" "${ref}")
 endfunction()
 
 navi_add_gates("" "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
