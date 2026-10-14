@@ -101,6 +101,7 @@ std::string BenchResult::to_json() const {
     }
     j.opt("wav_sha256", wav_sha256);
     j.str("text", text);
+    j.str("voice", voice);
     j.u64("seed", seed);
     j.ss << '}';
     return j.ss.str();
@@ -118,6 +119,7 @@ BenchResult run_bench(const Device & dev, const BenchOptions & opt) {
     r.multiprocessors = dev.info().multiprocessors;
     r.text           = opt.text;
     r.seed           = opt.seed;
+    r.voice          = opt.voice_wav.substr(opt.voice_wav.find_last_of('/') + 1);
 
     const auto t0 = clock::now();
     NaviFile file = NaviFile::open(opt.model_path);

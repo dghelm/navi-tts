@@ -51,6 +51,7 @@ struct BenchResult {
     std::vector<std::pair<int, double>> frame_ms_at;
     std::optional<std::string> wav_sha256;
     std::string text;
+    std::string voice;          // the reference WAV's basename: a run with another voice is another measurement
     std::uint64_t seed = 0;
 
     std::string to_json() const;
