@@ -132,9 +132,10 @@ of 10 `navi-tts bench` runs, bench text at seed 2:
 ## In-context cloning: what the conditioning costs (2026-10-13, gfx1151)
 
 Medians of 10 runs per cell, the two modes **interleaved** in one window so the session
-drift below lands on both equally, same model, same text, same seed, and the same
-reference clip (the owner's 20 s = 250 frames, with its own transcript - a mismatched
-pair makes the utterance length an artifact and RTF meaningless).
+drift below lands on both equally: same model, same text, same seed, and the same
+reference clip (the owner's 20 s = 250 frames, with its own transcript - a reference and a
+transcript that do not match make the utterance length an artifact rather than a
+measurement, so they have to be a pair).
 
 | | 0.6B embedding | 0.6B in-context | 1.7B embedding | 1.7B in-context |
 |---|---|---|---|---|
@@ -166,8 +167,8 @@ pair makes the utterance length an artifact and RTF meaningless).
   are summed into the same rows as the reference's codes, so the prompt is not reusable
   across requests - only a faster prefill would help.
 - **13 % / 9 % less audio for the same text.** Not a performance number but the reason
-  for the work: conditioning on the reference makes the model follow its pace, and the
-  owner's pace is faster than either model's prior. It is also why RTF rises more than
+  for the work: conditioning on the reference makes the model follow its pace, and this
+  reference's pace is faster than either model's prior. It is also why RTF rises more than
   the per-frame cost does - the same wall clock is spread over less audio.
 - The encoder itself costs **606 ms once per clone** for a 15 s clip (`voices add`,
   beside the speaker encoder's ~9 ms) and 190 MB of resident VRAM. Nothing per frame.
@@ -189,6 +190,21 @@ number:
   stayed 1.63× across both regimes - a ratio survives the drift, an absolute number
   does not.
 
-So: compare interleaved, in one window, and treat a single cold run as ±5 %. The
-README's generated medians are over 10 runs and therefore sit in the slower regime,
-which is the honest number for "what this box does", not the best one.
+- **With other work on the box**, the gap is far larger than either of those, because this
+  SoC shares one power budget between its CPU and its iGPU: there is no separate card to
+  keep its clocks. Measured 2026-10-13 at load average 8-14 (other builds running, the GPU
+  otherwise this engine's alone), the same build that measures 20.05 ms/frame quiet measured
+  **28.88 ms** - about 40 % worse - with the 1.7B going 32.45 -> 42.84 ms and the vocoder
+  1.33 -> 1.82 ms/frame, and the spread *within* that session staying at 4-11 %. So a
+  contended session is self-consistent and useless to compare against a quiet one.
+  The in-context ratios above were re-measured in that window and agreed to within 2-3
+  points (frame +14 %/+11 % against +12 %/+8 %, prefill 5.6x/5.6x against 5.1x/4.6x, and the
+  frame counts identical), which is the strongest evidence here that a ratio survives what
+  an absolute number does not. Those rows are deliberately not in `bench/results.jsonl`:
+  this file's rule is that contended numbers are not comparable, and they are kept here as
+  a measurement of contention rather than of the engine.
+
+So: compare interleaved, in one window, with the box otherwise idle, and treat a single
+cold run as ±5 %. The README's generated medians are over 10 runs and therefore sit in the
+slower end of the quiet regime, which is the honest number for "what this box does", not
+the best one.
