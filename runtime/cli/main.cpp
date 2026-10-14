@@ -49,6 +49,7 @@ struct Args {
     std::string name;           // voices add
     int batch = -1;             // bench: vocoder batch (-1 = the harness default)
     std::string ref_text;
+    bool no_icl = false;        // clone by speaker embedding only, even with a transcript
     std::vector<std::string> rest;   // positional: voices <action> [id]
     bool upload = false;
     bool warmup = true;
@@ -60,11 +61,11 @@ int usage(const char * argv0) {
     std::fprintf(stderr,
         "navi-tts %s (%s, ROCm %s, %s)\n"
         "usage: %s info  [--model FILE] [--upload] [-v]\n"
-        "       %s bench --model FILE [--out results.jsonl] [--repeats N] [--voice REF.wav] [--seed N] [--batch FRAMES]\n"
-        "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy]\n"
+        "       %s bench --model FILE [--out results.jsonl] [--repeats N] [--voice REF.wav] [--seed N] [--batch FRAMES] [--ref-text TEXT|@FILE]\n"
+        "       %s synth --model FILE --text TEXT (--voice REF.wav | --speaker EMB.npy) --out out.wav [--seed N] [--language L] [--max-frames N] [--greedy] [--ref-text TEXT|@FILE] [--no-icl]\n"
         "       %s serve --model FILE [--voices DIR] [--default-voice ID] [--model-id ID] [--host 127.0.0.1] [--port 8080] [--xtts-port 8020] [--xtts-fallback-male ID] [--xtts-fallback-female ID] [--max-frames 600] [--no-warmup] [-V]\n"
         "       %s voices [--voices DIR] list\n"
-        "       %s voices [--voices DIR] add --model FILE --name NAME --voice REF.wav [--ref-text TEXT]\n"
+        "       %s voices [--voices DIR] add --model FILE --name NAME --voice REF.wav [--ref-text TEXT|@FILE]\n"
         "       %s voices [--voices DIR] rm ID\n"
         "  --voices defaults to $XDG_DATA_HOME/navi-tts/voices (~/.local/share/navi-tts/voices)\n",
         NAVI_GIT_HASH, NAVI_GPU_ARCHS, NAVI_ROCM_VERSION, NAVI_BUILD_TYPE, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
@@ -104,6 +105,7 @@ Args parse(int argc, char ** argv) {
         else if (s == "--name") a.name = next("--name");
         else if (s == "--batch") a.batch = std::stoi(next("--batch"));
         else if (s == "--ref-text") a.ref_text = next("--ref-text");
+        else if (s == "--no-icl") a.no_icl = true;
         else if (s == "-v" || s == "-V" || s == "--verbose") a.verbose = true;
         else if (!s.empty() && s[0] != '-') a.rest.push_back(s);
         else navi::fail("unknown argument " + s);
@@ -238,6 +240,17 @@ int cmd_info(const Args & a) {
     return 0;
 }
 
+// A transcript given as @FILE is read from that file; anything else is the text itself.
+// A 20 s reference passage is not something to paste on a command line.
+std::string read_ref_text(const std::string & arg) {
+    if (arg.empty() || arg[0] != '@') return arg;
+    std::ifstream f(arg.substr(1), std::ios::binary);
+    if (!f) navi::fail("cannot read " + arg.substr(1));
+    std::string text((std::istreambuf_iterator<char>(f)), {});
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
+    return text;
+}
+
 int cmd_bench(const Args & a) {
     if (a.model.empty()) navi::fail("bench needs --model");
     navi::Device dev = navi::Device::open();
@@ -248,6 +261,7 @@ int cmd_bench(const Args & a) {
     if (!a.text.empty()) opt.text = a.text;
     if (a.seed) opt.seed = a.seed;
     if (a.batch >= 0) opt.vocoder_batch = a.batch;
+    opt.ref_text = read_ref_text(a.ref_text);
     for (int i = 0; i < a.repeats; ++i) {
         const navi::BenchResult r = navi::run_bench(dev, opt);
         const std::string line = r.to_json();
@@ -275,16 +289,34 @@ int cmd_synth(const Args & a) {
     auto graph = navi::qwen3tts::Graph::load(dev, a.model);
     const double load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     std::vector<float> spk;
+    std::vector<std::int32_t> ref_codes;
+    int ref_frames = 0;
+    // --ref-text turns on in-context cloning: the reference's own words, so the engine
+    // conditions on the pair (audio, transcript) instead of the embedding alone. @FILE
+    // reads the transcript from a file, which is how a 20 s passage gets in.
+    std::string ref_text = a.no_icl ? std::string() : read_ref_text(a.ref_text);
     if (!a.voice.empty()) {
-        spk = graph->embed_speaker(read_reference(a.voice, graph->params()).pcm);
+        const auto wav = read_reference(a.voice, graph->params());
+        spk = graph->embed_speaker(wav.pcm);
+        if (!ref_text.empty()) {
+            if (!graph->has_codec_encoder()) {
+                navi::fail("--ref-text needs a model converted with --with-encoder (navi-tts info --model "
+                           "says whether this one has the codec encoder)");
+            }
+            ref_codes = graph->encode_reference(wav.pcm, &ref_frames);
+        }
     } else {
         spk = navi::Npy::load(a.speaker).as_f32();
+        if (!ref_text.empty()) navi::fail("--ref-text needs --voice REF.wav: the codes come from the audio");
     }
 
     navi::qwen3tts::SynthRequest req;
     req.text = a.text;
     req.language = a.language;
     req.speaker = spk;
+    req.ref_text = ref_text;
+    req.ref_codes = ref_codes;
+    req.ref_frames = ref_frames;
     req.seed = a.seed;
     req.max_frames = a.max_frames;
     if (a.greedy) { req.sampling.temperature = 0.f; req.sampling.cp_temperature = 0.f; }
@@ -292,9 +324,11 @@ int cmd_synth(const Args & a) {
     const auto st = graph->synth(req, pcm);
     navi::audio::write_wav(a.out, pcm, graph->params().codec_sample_rate);
     std::fprintf(stderr,
-                 "load %.0f ms | %d tokens, %d frames (%s) | prefill %.1f ms, frames %.1f ms (%.2f ms/frame), "
-                 "vocoder %.1f ms | ttfa %.0f ms | %.2f s audio in %.0f ms, RTF %.3f | %s\n",
-                 load_ms, st.n_tokens, st.n_frames, st.eos ? "eos" : "cap", st.prefill_ms, st.frames_ms,
+                 "load %.0f ms | %d tokens, %s %d prefill rows, %d frames (%s) | prefill %.1f ms, "
+                 "frames %.1f ms (%.2f ms/frame), vocoder %.1f ms | ttfa %.0f ms | %.2f s audio in %.0f ms, "
+                 "RTF %.3f | %s\n",
+                 load_ms, st.n_tokens, st.icl ? "icl," : "embedding-only,", st.prefill_rows,
+                 st.n_frames, st.eos ? "eos" : "cap", st.prefill_ms, st.frames_ms,
                  st.n_frames ? st.frames_ms / st.n_frames : 0.0, st.vocoder_ms, st.ttfa_ms, st.audio_s, st.total_ms,
                  st.rtf, a.out.c_str());
     return 0;
@@ -328,8 +362,9 @@ int cmd_voices(const Args & a) {
     if (action == "list") {
         navi::voices::Store store = navi::voices::Store::open(a.voices_dir, 0);   // no model: any embedding size
         for (const auto & v : store.all()) {
-            std::printf("%-28s %-28s %5.1f s  %zu-d  %s  %s\n", v->id.c_str(), v->name.c_str(), v->sample_seconds,
-                        v->embedding.size(), v->created.c_str(), v->model.c_str());
+            std::printf("%-28s %-28s %5.1f s  %zu-d  %-9s %s  %s\n", v->id.c_str(), v->name.c_str(),
+                        v->sample_seconds, v->embedding.size(), v->icl() ? "icl" : "embedding",
+                        v->created.c_str(), v->model.c_str());
         }
         return 0;
     }
@@ -352,10 +387,12 @@ int cmd_voices(const Args & a) {
         navi::voices::Voice v;
         v.id = navi::voices::Store::id_for(a.name);
         v.name = a.name;
-        v.ref_text = a.ref_text;
+        v.ref_text = read_ref_text(a.ref_text);
         v.model = a.model_id;
         v.sample_sha256 = navi::voices::Store::sha256_hex(sample);
-        if (auto cur = store.find(v.id); cur && cur->sample_sha256 == v.sample_sha256) {
+        // Unchanged means the same audio AND the same transcript AND the same ICL state:
+        // a voice registered before its transcript was known has to be re-cloned to gain it.
+        if (store.current(v.id, v.sample_sha256, v.ref_text, graph->has_codec_encoder())) {
             std::printf("%s: unchanged\n", v.id.c_str());
             return 0;
         }
@@ -363,9 +400,19 @@ int cmd_voices(const Args & a) {
         v.sample_seconds = static_cast<double>(wav.pcm.size()) / wav.sample_rate;
         const bool replaced = store.find(v.id) != nullptr;
         v.embedding = graph->embed_speaker(wav.pcm);
+        if (!v.ref_text.empty() && graph->has_codec_encoder()) {
+            v.ref_codes = graph->encode_reference(wav.pcm, &v.ref_frames);
+        } else if (!v.ref_text.empty()) {
+            std::fprintf(stderr, "note: %s keeps its transcript but has no reference codes - this model has "
+                                 "no codec encoder (convert.py --with-encoder), so it will clone by speaker "
+                                 "embedding alone\n", v.id.c_str());
+        }
+        const int frames = v.ref_frames;
         store.put(std::move(v), sample);
-        std::printf("%s: %s (%.1f s of audio) -> %s\n", navi::voices::Store::id_for(a.name).c_str(),
-                    replaced ? "replaced" : "added", static_cast<double>(wav.pcm.size()) / wav.sample_rate, a.voices_dir.c_str());
+        std::printf("%s: %s (%.1f s of audio%s) -> %s\n", navi::voices::Store::id_for(a.name).c_str(),
+                    replaced ? "replaced" : "added", static_cast<double>(wav.pcm.size()) / wav.sample_rate,
+                    frames ? (", in-context: " + std::to_string(frames) + " reference frames").c_str() : "",
+                    a.voices_dir.c_str());
         return 0;
     }
     navi::fail("voices: unknown action " + action + " (list|add|rm)");

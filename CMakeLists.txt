@@ -142,6 +142,8 @@ add_executable(test_speaker tests/test_speaker.cpp)
 target_link_libraries(test_speaker PRIVATE navi_qwen3tts navi_runtime)
 add_executable(test_codec_encoder tests/test_codec_encoder.cpp)
 target_link_libraries(test_codec_encoder PRIVATE navi_qwen3tts navi_runtime)
+add_executable(test_icl_synth tests/test_icl_synth.cpp)
+target_link_libraries(test_icl_synth PRIVATE navi_qwen3tts navi_runtime)
 
 # navi_add_gates(<suffix> <model.navi> <reference dir>)
 function(navi_add_gates suffix model ref)
@@ -152,6 +154,8 @@ function(navi_add_gates suffix model ref)
     add_test(NAME speaker${suffix} COMMAND test_speaker "${model}" "${ref}")
     # Skips itself (exit 0) on a blob converted without --with-encoder.
     add_test(NAME codec_encoder${suffix} COMMAND test_codec_encoder "${model}" "${ref}")
+    # Uses stored codes, so it needs no encoder - that is what it checks.
+    add_test(NAME icl_synth${suffix} COMMAND test_icl_synth "${model}" "${ref}")
 endfunction()
 
 navi_add_gates("" "${NAVI_TEST_MODEL}" "${CMAKE_SOURCE_DIR}/tests/reference")
